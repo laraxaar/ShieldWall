@@ -20,8 +20,11 @@
  */
 
 const SESSION_DATA = new Map();
+const SESSION_GRAPHS = new Map();
+const RESOURCE_ACCESS = new Map();
 const MAX_SESSIONS = 50000;
 const MAX_SESSION_AGE = 24 * 60 * 60 * 1000;
+const HOSTING_ASN = new Set([14061, 16509, 24940, 13335, 15169]); // AWS, GCP, DigitalOcean, Cloudflare, Google
 
 const CITY_COORDS = {
   'US': { lat: 37.0902, lon: -95.7129 },
@@ -88,12 +91,13 @@ function calculateGeoVelocity(prevLocation, currLocation, timeDiff) {
  */
 function isSuspectedVPN(decodedReq) {
   if (!decodedReq.headers) return false;
-  // Deep inspection for proxy tunneling footprints
+  const isHosting = decodedReq.asn && HOSTING_ASN.has(decodedReq.asn);
   return !!(
     decodedReq.headers['via'] || 
     decodedReq.headers['x-forwarded-for']?.includes(',') ||
     decodedReq.headers['x-vpn'] ||
-    decodedReq.headers['surrogate-capability']
+    decodedReq.headers['surrogate-capability'] ||
+    isHosting
   );
 }
 
@@ -115,8 +119,15 @@ function checkGeoVelocity(sessionId, geoData, decodedReq) {
   const country = geoData.country?.toUpperCase();
   const prevCountry = data.lastLocation.country?.toUpperCase();
 
-  const currCoords = CITY_COORDS[country] || CITY_COORDS['US'];
-  const prevCoords = CITY_COORDS[prevCountry] || CITY_COORDS['US'];
+  const currCoords = {
+    lat: geoData.city?.latitude || CITY_COORDS[country]?.lat || CITY_COORDS['US'].lat,
+    lon: geoData.city?.longitude || CITY_COORDS[country]?.lon || CITY_COORDS['US'].lon
+  };
+
+  const prevCoords = {
+    lat: data.lastLocation.lat || CITY_COORDS[prevCountry]?.lat || CITY_COORDS['US'].lat,
+    lon: data.lastLocation.lon || CITY_COORDS[prevCountry]?.lon || CITY_COORDS['US'].lon
+  };
 
   const velocity = calculateGeoVelocity(
     { ...prevCoords, timestamp: data.lastLocation.timestamp },
@@ -202,7 +213,7 @@ function checkFingerprintChange(sessionId, fingerprint) {
  * @returns {Array} Risk match instances for engine evaluation.
  */
 function check(decodedReq) {
-  const sessionId = decodedReq.sessionId;
+  const sessionId = decodedReq.sessionId || `${decodedReq.ip}:${decodedReq.userAgent}`;
   if (!sessionId) return [];
 
   const now = Date.now();
@@ -216,11 +227,56 @@ function check(decodedReq) {
 
   const indicators = [];
 
+  // --- 1. Request Lineage (Process Tree Analogue) ---
+  if (!SESSION_GRAPHS.has(sessionId)) SESSION_GRAPHS.set(sessionId, []);
+  const history = SESSION_GRAPHS.get(sessionId);
+  const currentPath = decodedReq.path || '/';
+
+  if (currentPath.startsWith('/api/') && !currentPath.includes('/public/')) {
+    const hasUiReferer = history.some(p => !p.startsWith('/api/'));
+    if (!hasUiReferer && history.length < 3) {
+      indicators.push({ type: 'orphan_api_call', detail: 'API call without prior frontend navigation' });
+    }
+  }
+
+  if (history.length > 2) {
+    const lastTime = history[history.length - 1].ts;
+    const timeDiff = now - lastTime;
+    if (timeDiff < 200 && history[history.length - 1].path !== currentPath) {
+      indicators.push({ type: 'rate_velocity', detail: 'Rapid cross-page navigation' });
+    }
+  }
+
+  history.push({ path: currentPath, ts: now });
+  if (history.length > 20) history.shift();
+
+  // --- 2. Lateral Movement (BOLA / IDOR Detection) ---
+  const accessMap = RESOURCE_ACCESS.get(sessionId) || {};
+  const bodyObj = typeof decodedReq.body === 'object' && decodedReq.body !== null ? decodedReq.body : {};
+  const allParams = { ...(decodedReq.query || {}), ...bodyObj };
+
+  for (const [key, val] of Object.entries(allParams)) {
+    const strVal = String(val);
+    if (/^\d+$/.test(strVal) || /^[0-9a-f]{8}-[0-9a-f]{4}/i.test(strVal)) {
+      if (!accessMap[key]) accessMap[key] = new Set();
+      if (accessMap[key].size < 10) {
+        accessMap[key].add(strVal);
+      }
+      
+      if (accessMap[key].size > 5) {
+        indicators.push({ type: 'lateral_movement', detail: `Accessed ${accessMap[key].size}+ unique IDs for param "${key}"` });
+      }
+    }
+  }
+  RESOURCE_ACCESS.set(sessionId, accessMap);
+
   if (decodedReq.geoip && typeof decodedReq.geoip === 'object') {
     const geoAlerts = checkGeoVelocity(sessionId, decodedReq.geoip, decodedReq);
     indicators.push(...geoAlerts);
     data.lastLocation = {
       country: decodedReq.geoip.country,
+      lat: decodedReq.geoip.city?.latitude,
+      lon: decodedReq.geoip.city?.longitude,
       timestamp: now,
     };
   }
@@ -231,12 +287,13 @@ function check(decodedReq) {
     data.fingerprint = decodedReq.fingerprint;
   }
 
-  data.ips.add(decodedReq.ip);
-  if (data.ips.size > 5) {
-    // 5 unique IPs on ONE session token hints heavily towards token sharing/extortion.
+  if (data.ips.size < 20) {
+    data.ips.add(decodedReq.ip);
+  }
+  if (data.ips.size > 10) {
     indicators.push({
       type: 'session_ip_flood',
-      detail: `Session shared across ${data.ips.size} unique IPs`,
+      detail: `Session shared across ${data.ips.size}+ unique IPs`,
     });
   }
 
@@ -265,8 +322,12 @@ function _cleanup() {
   for (const [key, value] of SESSION_DATA.entries()) {
     if (value.firstSeen < cutoff) {
       SESSION_DATA.delete(key);
+      SESSION_GRAPHS.delete(key);
+      RESOURCE_ACCESS.delete(key);
     }
   }
 }
+
+setInterval(_cleanup, 300000).unref(); // Run every 5 minutes
 
 module.exports = { check, checkGeoVelocity, checkFingerprintChange, CITY_COORDS };

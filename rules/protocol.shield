@@ -49,8 +49,8 @@ rule host_header_injection : protocol {
         $headers = request.headers
 
     strings:
-        $host_inject = /host:.*[<>'";\(\)]/i
+        $host_inject = /host=[^&]*[<>'";\(\)]/i
 
     condition:
-        $host_inject
+        $host_inject in $headers
 }

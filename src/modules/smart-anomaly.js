@@ -153,6 +153,10 @@ class SmartAnomalyDetector {
     return stats;
   }
 
+  reload() {
+    this._loadRules();
+  }
+
   _loadRules() {
     try {
       this.rules = loadRulesFromDir(this.rulesDir);
@@ -194,37 +198,35 @@ class SmartAnomalyDetector {
 
   _normalize(str) {
     if (!str) return '';
-    let s = String(str);
-    for (let i = 0; i < 3; i++) {
-      try {
-        const d = decodeURIComponent(s);
-        if (d === s) break;
-        s = d;
-      } catch { break; }
-    }
-    return s.toLowerCase().normalize('NFKC');
+    return String(str).toLowerCase();
   }
 
   _extractRequestFeatures(decodedReq) {
-    const features = {
-      url: this._normalize(decodedReq.url),
-      path: this._normalize(decodedReq.path),
-      method: (decodedReq.method || 'GET').toUpperCase(),
-      query: this._normalize(JSON.stringify(decodedReq.query || {})),
-      body: this._normalize(typeof decodedReq.body === 'string' ? decodedReq.body : JSON.stringify(decodedReq.body || {})),
-      headers: this._normalize(JSON.stringify(decodedReq.headers || {})),
-      cookies: this._normalize(JSON.stringify(decodedReq.cookies || {})),
-      userAgent: (decodedReq.userAgent || '').toLowerCase(),
+    const extractValues = (obj, depth = 0) => {
+      if (depth > 5) return [];
+      if (typeof obj === 'string') return [obj];
+      if (Array.isArray(obj)) return obj.flatMap(v => extractValues(v, depth + 1));
+      if (obj && typeof obj === 'object') return Object.values(obj).flatMap(v => extractValues(v, depth + 1));
+      return [String(obj || '')];
     };
 
-    const rawFields = [
-      decodedReq.url, decodedReq.body, JSON.stringify(decodedReq.query),
-      JSON.stringify(decodedReq.headers), decodedReq.userAgent
-    ].join(' ');
-    const allFields = Object.values(features).join(' ');
+    const queryVals = extractValues(decodedReq.query).map(v => v.slice(0, 1000)).filter(Boolean);
+    const bodyVals = extractValues(decodedReq.body).map(v => v.slice(0, 1000)).filter(Boolean);
+    const headerVals = extractValues(decodedReq.headers).map(v => v.slice(0, 1000)).filter(Boolean);
+    const cookieVals = extractValues(decodedReq.cookies).map(v => v.slice(0, 1000)).filter(Boolean);
+
+    const allValues = [...queryVals, ...bodyVals, ...headerVals, ...cookieVals];
+    const allFields = allValues.join(' ').toLowerCase();
 
     return {
-      ...features,
+      url: (decodedReq.url || '').toLowerCase(),
+      path: (decodedReq.path || '').toLowerCase(),
+      method: (decodedReq.method || 'GET').toUpperCase(),
+      query: queryVals.join(' ').toLowerCase(),
+      body: bodyVals.join(' ').toLowerCase(),
+      headers: headerVals.join(' ').toLowerCase(),
+      cookies: cookieVals.join(' ').toLowerCase(),
+      userAgent: (decodedReq.userAgent || '').toLowerCase(),
       allFields,
       entropy: this._calculateEntropy(allFields),
       encodingLayers: this._countEncodingLayers(allFields),
@@ -237,6 +239,20 @@ class SmartAnomalyDetector {
 
   _calculateEntropy(str) {
     if (!str || str.length < 10) return 0;
+    
+    // SLIDING WINDOW ENTROPY (detects hidden payloads in large strings)
+    const windowSize = 64;
+    if (str.length <= windowSize) return this._calculateChunkEntropy(str);
+    
+    let maxEntropy = 0;
+    for (let i = 0; i < str.length - windowSize; i += 32) { // Step of 32 for performance
+      const chunk = str.slice(i, i + windowSize);
+      maxEntropy = Math.max(maxEntropy, this._calculateChunkEntropy(chunk));
+    }
+    return maxEntropy;
+  }
+
+  _calculateChunkEntropy(str) {
     const freq = new Map();
     for (const char of str) {
       freq.set(char, (freq.get(char) || 0) + 1);
@@ -355,10 +371,6 @@ class SmartAnomalyDetector {
       add(5, 'null_byte', 'Null byte detected - possible bypass attempt');
     }
 
-    if (/[a-z][A-Z]|[A-Z][a-z]/.test(rawFields)) {
-      add(3, 'mixed_casing', 'Mixed case obfuscation detected');
-    }
-
     if (/%[0-9a-f]{2}/i.test(rawFields) && /\\x[0-9a-f]{2}/i.test(rawFields)) {
       add(4, 'mixed_encoding', 'Mixed URL and hex encoding');
     }
@@ -386,12 +398,15 @@ class SmartAnomalyDetector {
         for (const field of ['url', 'body', 'query', 'headers', 'cookies', 'userAgent']) {
           const result = this._fuzzyPatternMatch(features[field], pattern);
           if (result.matched) {
-            catScore += 10;
-            matchedPatterns.push({ pattern: pattern.name, field, type: 'direct' });
+            // Severity-based direct match scoring
+            const weight = profile.severity === 'critical' ? 30 : (profile.severity === 'high' ? 20 : 10);
+            catScore += weight;
+            matchedPatterns.push({ pattern: pattern.name, field, type: 'direct', weight });
           } else if (result.similarity > 0.7 && !this.safeMode) {
             // Safe mode: skip fuzzy matches entirely
-            catScore += result.similarity * 2;
-            matchedPatterns.push({ pattern: pattern.name, field, type: 'fuzzy', similarity: result.similarity });
+            const weight = (profile.severity === 'critical' ? 10 : 5) * result.similarity;
+            catScore += weight;
+            matchedPatterns.push({ pattern: pattern.name, field, type: 'fuzzy', similarity: result.similarity, weight });
           }
         }
       }
@@ -480,7 +495,12 @@ class SmartAnomalyDetector {
     }
     const history = ANOMALY_HISTORY.get(ip);
     const cats = result.categoryScores ? Object.keys(result.categoryScores) : [];
-    history.push({ timestamp: now, score: result.score, categories: cats });
+    history.push({ 
+      timestamp: now, 
+      score: result.score, 
+      categories: cats,
+      indicators: result.analysis?.topIndicators?.map(i => i.type) || []
+    });
 
     const cutoff = now - HISTORY_WINDOW;
     while (history.length > 0 && history[0].timestamp < cutoff) {
@@ -493,25 +513,38 @@ class SmartAnomalyDetector {
 
   _calculateTemporalAnomaly(ip, currentResult) {
     const history = ANOMALY_HISTORY.get(ip) || [];
-    if (history.length < 3) return null;
+    if (history.length < 2) return null;
 
     const recent = history.slice(-5);
+    
+    // 1. Cross-Request Fragmentation Check (Elite Vector)
+    // Detects attacks split across multiple requests (e.g. SELECT in req1, FROM in req2)
+    const partialSignals = ['sql_indicator', 'xss_indicator', 'path_indicator'];
+    const pastSignals = new Set(recent.flatMap(h => h.indicators || []));
+    const currentSignals = currentResult.analysis?.topIndicators?.map(i => i.type) || [];
+    
+    const crossRequestAttack = partialSignals.some(s => pastSignals.has(s)) && 
+                               currentSignals.some(s => partialSignals.includes(s));
+
+    if (crossRequestAttack) {
+      return {
+        type: 'cross_request_fragmentation',
+        detail: 'Attack indicators correlated across sequential requests from same IP',
+        weight: this._getEffectiveWeight('cross_request_fragmentation', 15),
+        baseWeight: 15
+      };
+    }
+
+    // 2. Score Spike Check
     const avgScore = recent.reduce((a, h) => a + h.score, 0) / recent.length;
-    const scoreSpike = currentResult.score > avgScore * 2;
+    const scoreSpike = currentResult.score > avgScore * 2 && currentResult.score > 10;
 
-    const allCats = new Set();
-    recent.forEach(h => h.categories.forEach(c => allCats.add(c)));
-    const currentCats = currentResult.categoryScores ? Object.keys(currentResult.categoryScores) : [];
-    const newCats = currentCats.filter(c => !allCats.has(c));
-
-    if (scoreSpike || newCats.length > 0) {
+    if (scoreSpike) {
       return {
         type: 'behavioral_shift',
-        detail: scoreSpike
-          ? `Score spike: ${currentResult.score.toFixed(1)} vs avg ${avgScore.toFixed(1)}`
-          : `New attack vectors: ${newCats.join(', ')}`,
-        weight: this._getEffectiveWeight('behavioral_shift', scoreSpike ? 5 : 3),
-        baseWeight: scoreSpike ? 5 : 3,
+        detail: `Score spike: ${currentResult.score.toFixed(1)} vs avg ${avgScore.toFixed(1)}`,
+        weight: this._getEffectiveWeight('behavioral_shift', 5),
+        baseWeight: 5,
       };
     }
     return null;
@@ -520,11 +553,11 @@ class SmartAnomalyDetector {
   _detectCrossFieldCorrelation(features) {
     const signals = [];
 
-    if (features.query?.includes('select') && features.body?.includes('from')) {
-      signals.push({ type: 'distributed_sqli', weight: this._getEffectiveWeight('distributed_sqli', 6), baseWeight: 6, detail: 'SELECT in query + FROM in body' });
+    if (/(select\s+.*|['"`;]\s*select)/i.test(features.query) && /(from\s+.*|--|#|\/\*)/i.test(features.body)) {
+      signals.push({ type: 'distributed_sqli', weight: this._getEffectiveWeight('distributed_sqli', 6), baseWeight: 6, detail: 'SELECT in query + FROM/comments in body' });
     }
 
-    if (features.url?.includes('union') && features.body?.includes('select')) {
+    if (/(union\s+.*|['"`;]\s*union)/i.test(features.url) && /(select\s+.*|--|#|\/\*)/i.test(features.body)) {
       signals.push({ type: 'fragmented_union', weight: this._getEffectiveWeight('fragmented_union', 5), baseWeight: 5, detail: 'UNION/SELECT split across fields' });
     }
 
@@ -741,7 +774,7 @@ setInterval(() => {
   const now = Date.now();
   for (const [ip, history] of ANOMALY_HISTORY.entries()) {
     // Delete entries completely untouched over the interval
-    if (history.requests.length === 0 || now - history.requests[history.requests.length - 1].timestamp > HISTORY_WINDOW) {
+    if (history.length === 0 || now - history[history.length - 1].timestamp > HISTORY_WINDOW) {
       ANOMALY_HISTORY.delete(ip);
     }
   }

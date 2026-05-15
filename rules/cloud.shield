@@ -1,6 +1,6 @@
 rule aws_metadata_ssrf : ssrf {
     meta:
-        author = "laraxaar"
+        author = "shieldwall-core"
         description = "Detects attempts to access AWS IMDSv1/v2 metadata via SSRF"
         severity = "critical"
         category = "ssrf"
@@ -23,7 +23,7 @@ rule aws_metadata_ssrf : ssrf {
 
 rule gcp_metadata_ssrf : ssrf {
     meta:
-        author = "laraxaar"
+        author = "shieldwall-core"
         description = "Detects attempts to access GCP metadata via SSRF Header Injection"
         severity = "critical"
         category = "ssrf"
@@ -48,7 +48,7 @@ rule gcp_metadata_ssrf : ssrf {
 
 rule azure_metadata_ssrf : ssrf {
     meta:
-        author = "laraxaar"
+        author = "shieldwall-core"
         description = "Detects attempts to access Azure metadata via SSRF"
         severity = "critical"
         category = "ssrf"

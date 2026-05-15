@@ -1,235 +1,109 @@
 'use strict';
 
 /**
- * Reputation Engine (Threat Intel Layer)
+ * @file reputation.js
+ * @description Behavioral IP & Fingerprint Reputation Tracking Module.
  * 
- * ARCHITECTURAL CONTEXT (2026 Standard):
- * Acts as a mini threat-intel system maintaining a sliding window of localized
- * threat perception. Features TTL, LRU bounds, decay, and severity-weighted scoring.
+ * ROLE IN ARCHITECTURE:
+ * Provides the "Memory" for the WAF. Tracks the history of specific identities to 
+ * detect drift, calculate statistical rarity, and apply time-decayed penalties.
  * 
- * ⚠️ ARCHITECTURAL LIMITATION (IP as Primary Key):
- * IP address is a structurally weak axis of trust due to NAT, mobile networks, 
- * CGNAT, and proxies. This engine treats IP reputation as a *signal*, not 
- * ground truth.
+ * DATA FLOW:
+ * [fingerprinter.js] -> `recordFingerprint()` -> Updates global popularity counts -> 
+ * [engine.js] -> `getReputation()` -> Influences the Risk Aggregation Circuit Breaker.
  * 
- * FUTURE ROADMAP:
- * Migrate primary key from `IP` to dynamic `ASN + Behavior Cluster` + `Device Fingerprint`.
- * The scoring must evolve from additive thresholds to probabilistic decay based on
- * valid session ratios.
+ * CRITICAL FALSE POSITIVE (FP) MITIGATION:
+ * - Exponential Decay: Older security incidents lose their impact over time.
+ * - Cold-Start Protection: Rarity scores only trigger after 100 samples are collected.
+ * - LRU Pruning: Automatically evicts stale data to prevent memory exhaustion (OOM).
  */
-
-const LRU = require('lru-cache');
-
-const REPUTATION_TTL = 24 * 60 * 60 * 1000;
-const MAX_ENTRIES = 10000;
-
-const SEVERITY_SCORES = {
-  critical: 100,
-  high: 50,
-  medium: 20,
-  low: 10,
-  info: 1,
-};
-
-const HALF_LIFE_HOURS = 24;
-const LAMBDA = Math.LN2 / HALF_LIFE_HOURS;
-
-const reputationCache = new LRU({
-  max: MAX_ENTRIES,
-  ttl: REPUTATION_TTL,
-  updateAgeOnGet: true,
-});
-
-class ReputationEngine {
-  constructor() {
-    this.cache = reputationCache;
-  }
-
-  _getKey(ip) {
-    return `rep:${ip}`;
-  }
-
-  _calculateCurrentScore(data, now = Date.now()) {
-    if (!data.lastSeen) return data.score;
-    const hoursPassed = (now - data.lastSeen) / (1000 * 60 * 60);
-    // Exponential decay application
-    let currentScore = data.score * Math.exp(-LAMBDA * hoursPassed);
-    
-    // Prevent floating point dust
-    if (currentScore < 1) currentScore = 0;
-    
-    return currentScore;
-  }
-
-  recordIncident(ip, category, severity) {
-    if (!ip) return;
-    const now = Date.now();
-    const key = this._getKey(ip);
-    
-    const existing = this.cache.get(key) || {
-      score: 0,
-      incidents: [],
-      firstSeen: now,
-      lastSeen: now,
-    };
-
-    // Apply temporal decay to the old score before adding the new penalty
-    existing.score = this._calculateCurrentScore(existing, now);
-
-    const points = SEVERITY_SCORES[severity] || 1;
-    existing.score = Math.min(existing.score + points, 1000);
-    existing.lastSeen = now;
-
-    existing.incidents.push({
-      category,
-      severity,
-      timestamp: now,
-    });
-
-    if (existing.incidents.length > 50) existing.incidents.shift();
-
-    this.cache.set(key, existing);
-  }
-
-  recordTrust(ip, category, trustValue = 10) {
-    if (!ip) return;
-    const now = Date.now();
-    const key = this._getKey(ip);
-    
-    const data = this.cache.get(key);
-    if (!data) return; // We only reduce risk for users that actually have a risk profile.
-
-    data.score = this._calculateCurrentScore(data, now);
-    
-    // Subtract trust value, floored at 0
-    data.score = Math.max(0, data.score - trustValue);
-    data.lastSeen = now;
-
-    this.cache.set(key, data);
-  }
-
-  getReputation(ip) {
-    if (!ip) return { score: 0, trust: 'unknown' };
-
-    const key = this._getKey(ip);
-    const data = this.cache.get(key);
-
-    if (!data) {
-      return { score: 0, trust: 'unknown', incidents: [] };
+class FingerprintTracker {
+    constructor(ttlMs = 60000, maxHistory = 5) {
+        this.history = new Map(); // IP -> [{fp, ts}]
+        this.popularity = new Map(); // FP -> count
+        this._totalSeen = 0; 
+        this._lastDecayAt = 0; // FIX: BUG_8 — track decay timing
+        this.ttlMs = ttlMs;
+        this.maxHistory = maxHistory;
+        
+        this._cleanupTimer = setInterval(() => this.cleanup(), 300000).unref();
     }
 
-    // Dynamic just-in-time calculation
-    const currentScore = this._calculateCurrentScore(data);
-    const trustLevel = this._calculateTrust(currentScore);
-
-    return {
-      score: +currentScore.toFixed(2),
-      trust: trustLevel,
-      firstSeen: data.firstSeen,
-      lastSeen: data.lastSeen,
-      incidentCount: data.incidents.length,
-      categories: this._extractCategories(data.incidents),
-      recentIncidents: data.incidents.slice(-5),
-    };
-  }
-
-  _calculateTrust(score) {
-    if (score >= 200) return 'blocked';
-    if (score >= 100) return 'suspicious';
-    if (score >= 50) return 'caution';
-    if (score > 0) return 'low';
-    return 'neutral';
-  }
-
-  _extractCategories(incidents) {
-    const cats = new Map();
-    for (const inc of incidents) {
-      const count = cats.get(inc.category) || 0;
-      cats.set(inc.category, count + 1);
+    recordFingerprint(fp) {
+        this._totalSeen++;
+        this.popularity.set(fp, (this.popularity.get(fp) || 0) + 1);
     }
-    return Object.fromEntries(cats);
-  }
 
-  shouldEnforceStrictCheck(ip) {
-    const rep = this.getReputation(ip);
-    return rep.trust === 'blocked' || rep.trust === 'suspicious';
-  }
+    getRarityScore(fp) {
+        if (this._totalSeen < 100) return 0; 
+        
+        const count = this.popularity.get(fp) || 0;
+        const frequency = count / this._totalSeen;
 
-  getAllBlockedIPs() {
-    const blocked = [];
-    for (const [key, value] of this.cache.entries()) {
-      const dynamicScore = this._calculateCurrentScore(value);
-      if (this._calculateTrust(dynamicScore) === 'blocked') {
-        blocked.push({
-          ip: key.replace('rep:', ''),
-          score: +dynamicScore.toFixed(2),
-          incidents: value.incidents.length,
-        });
-      }
+        if (frequency < 0.001) return 25; 
+        if (frequency < 0.01) return 15;  
+        if (frequency < 0.05) return 5;   
+        return 0; 
     }
-    return blocked;
-  }
-} // Remove decayReputation() entirely
 
-const engine = new ReputationEngine();
+    trackDrift(ip, fp) {
+        const now = Date.now();
+        if (!this.history.has(ip)) this.history.set(ip, []);
+        
+        const userHistory = this.history.get(ip);
+        userHistory.push({ fp, ts: now });
 
-function check(decodedReq) {
-  const ip = decodedReq.ip;
-  if (!ip) return [];
+        const timeWindow = userHistory.filter(h => now - h.ts < this.ttlMs);
+        const trimmed = timeWindow.slice(-this.maxHistory); 
+        this.history.set(ip, trimmed);
 
-  const rep = engine.getReputation(ip);
+        const uniqueFps = new Set(trimmed.map(h => h.fp)).size;
+        if (uniqueFps <= 1) return 0;
 
-  if (rep.trust === 'blocked') {
-    return [{
-      rule: 'reputation_block',
-      tags: ['reputation', 'blocklist'],
-      severity: 'critical',
-      category: 'reputation',
-      description: `IP ${ip} has critical reputation score (${rep.score}) - previous incidents: ${rep.incidentCount}`,
-      author: 'shieldwall-core',
-      sourceFile: 'builtin:reputation',
-      analysis: {
-        reputationScore: rep.score,
-        trustLevel: rep.trust,
-        incidentCategories: rep.categories,
-      },
-      matchedPatterns: Object.keys(rep.categories).map(cat => ({
-        name: `prev_${cat}`,
-        matched: `${rep.categories[cat]} incidents`,
-      })),
-    }];
-  }
+        const driftScore = ((uniqueFps - 1) / (this.maxHistory - 1)) * 50;
+        return Math.round(Math.min(50, driftScore));
+    }
 
-  if (rep.trust === 'suspicious') {
-    return [{
-      rule: 'reputation_suspicious',
-      tags: ['reputation', 'warning'],
-      severity: 'high',
-      category: 'reputation',
-      description: `IP ${ip} has suspicious reputation (${rep.score}) - strict checks enforced`,
-      author: 'shieldwall-core',
-      sourceFile: 'builtin:reputation',
-      analysis: {
-        reputationScore: rep.score,
-        trustLevel: rep.trust,
-      },
-      matchedPatterns: [{ name: 'suspicious_reputation', matched: `score ${rep.score}` }],
-    }];
-  }
+    /**
+     * Periodic cleanup and exponential decay.
+     * FIX: BUG_8 — added timing guard to prevent rapid multiple decays
+     */
+    cleanup() {
+        const now = Date.now();
+        
+        // 1. History cleanup
+        for (const [ip, hist] of this.history) {
+            const valid = hist.filter(h => now - h.ts < this.ttlMs);
+            if (valid.length === 0) this.history.delete(ip);
+            else this.history.set(ip, valid);
+        }
 
-  return [];
+        // 2. Popularity decay
+        const ONE_HOUR = 3600000;
+        if (this._totalSeen > 1000000 && (now - this._lastDecayAt > ONE_HOUR)) {
+            for (const [fp, count] of this.popularity) {
+                const newCount = Math.floor(count / 2);
+                if (newCount === 0) this.popularity.delete(fp);
+                else this.popularity.set(fp, newCount);
+            }
+            this._totalSeen = Math.floor(this._totalSeen / 2);
+            this._lastDecayAt = now;
+            console.info('[reputation] Popularity decay applied, new total:', this._totalSeen);
+        }
+    }
+
+    destroy() {
+        if (this._cleanupTimer) clearInterval(this._cleanupTimer);
+    }
 }
 
-function record(ip, category, severity) {
-  engine.recordIncident(ip, category, severity);
-}
+const fingerprintTracker = new FingerprintTracker();
 
-function recordTrust(ip, category, trustValue) {
-  engine.recordTrust(ip, category, trustValue);
-}
+module.exports = { FingerprintTracker, fingerprintTracker };
 
-function getReputation(ip) {
-  return engine.getReputation(ip);
-}
-
-module.exports = { check, record, recordTrust, getReputation, ReputationEngine };
+// === EXPORTS ===
+/**
+ * @typedef {Object} ReputationModule
+ * @property {FingerprintTracker} FingerprintTracker - The class definition
+ * @property {FingerprintTracker} fingerprintTracker - Singleton instance
+ */

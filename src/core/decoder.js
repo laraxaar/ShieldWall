@@ -1,174 +1,262 @@
 'use strict';
 
-// ─── Design Guarantees ──────────────────────────────────────────────────────
-//
-// 1. Bounded:  MAX_DECODE_DEPTH = 5 — recursion always terminates
-// 2. Pure:     no network calls, no filesystem access, no side effects
-// 3. Non-destructive: original request object is NEVER mutated;
-//              decodeRequest() returns a new object
-// 4. Deterministic: identical input → identical output, no randomness
-// 5. Security-neutral: decoder makes NO security decisions — it only
-//              produces a canonical representation for downstream analysis
-// 6. Readable output: base64 is only decoded when:
-//    - the blob appears in a parameter-value context (after = or :)
-//    - the blob is ≥40 chars (filters out short tokens/IDs)
-//    - the decoded result is printable ASCII and ≥4 chars
-//
-// What this does NOT do:
-//   - Does NOT validate or sanitize input
-//   - Does NOT block or allow requests
-//   - Does NOT make outbound connections
-//   - Does NOT persist any state between calls
-//
-// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * @file decoder.js
+ * @description Advanced Context-Aware Request Decoder & Normalizer.
+ * 
+ * ROLE:
+ * Neutralizes evasion attempts (URL encoding, HTML entities, Base64, Path traversal)
+ * by canonicalizing the request into a "clean" structural map.
+ */
 
 const MAX_DECODE_DEPTH = 5;
+const MAX_INPUT_LENGTH = 64 * 1024;
+const MAX_OUTPUT_LENGTH = 256 * 1024;
+const MAX_EXPANSION_RATIO = 8;
 
-function urlDecode(str) {
+
+
+/**
+ * Normalizes path and resolves traversal safely.
+ * FIX: BUG_3 — iterative resolution for nested ../ and trailing ..
+ */
+function normalizePath(str) {
+  let path = str.replace(/\\/g, '/').replace(/\/+/g, '/');
+  const parts = path.split('/');
+  const stack = [];
+  for (const part of parts) {
+    if (part === '..') {
+      if (stack.length > 0 && stack[stack.length - 1] !== '') stack.pop();
+    } else if (part !== '.' && part !== '') {
+      stack.push(part);
+    }
+  }
+  let resolved = '/' + stack.join('/');
+  if (path.endsWith('/') && !resolved.endsWith('/')) resolved += '/';
+  return resolved;
+}
+
+/**
+ * Strict Base64 decoder with round-trip validation.
+ * FIX: BUG_4 — added strict validation, padding check, expansion ratio
+ */
+function tryDecodeBase64(token) {
+  if (token.length < 8) return null;
+  const normalized = token.replace(/-/g, '+').replace(/_/g, '/');
+  
+  // Validate charset strictly
+  if (!/^[A-Za-z0-9+/]+=*$/.test(normalized)) return null;
+  
+  // Validate padding logic
+  const withoutPadding = normalized.replace(/=+$/, '');
+  const remainder = withoutPadding.length % 4;
+  if (remainder === 1) return null; // Invalid length for B64
+  
   try {
-    return decodeURIComponent(str);
+    const buf = Buffer.from(normalized, 'base64');
+    
+    // Round-trip check
+    const reEncoded = buf.toString('base64').replace(/=+$/, '');
+    if (reEncoded !== withoutPadding) return null;
+    
+    const decoded = buf.toString('utf8');
+    
+    // Quality checks
+    if (decoded.length < 4) return null;
+    if (!/^[\x09\x0A\x0D\x20-\x7E\u0400-\u04FF]+$/.test(decoded)) return null;
+    if (decoded.length > token.length * MAX_EXPANSION_RATIO) return null;
+    
+    return decoded;
   } catch {
-    return str.replace(/%([0-9A-Fa-f]{2})/g, (_, hex) =>
-      String.fromCharCode(parseInt(hex, 16))
-    );
+    return null;
   }
 }
 
-function htmlEntityDecode(str) {
-  const named = {
-    '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'",
-    '&nbsp;': ' ', '&tab;': '\t', '&excl;': '!', '&num;': '#',
-    '&lpar;': '(', '&rpar;': ')', '&sol;': '/', '&colon;': ':',
-    '&semi;': ';', '&equals;': '=', '&quest;': '?', '&lsqb;': '[',
-    '&rsqb;': ']', '&lbrace;': '{', '&rbrace;': '}', '&vert;': '|',
-  };
-
-  let result = str;
-  result = result.replace(/&[a-zA-Z]+;/g, m => named[m.toLowerCase()] || m);
-  result = result.replace(/&#x([0-9A-Fa-f]+);?/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
-  result = result.replace(/&#(\d+);?/g, (_, d) => String.fromCharCode(parseInt(d, 10)));
-  return result;
-}
-
-function unicodeDecode(str) {
-  return str
-    .replace(/\\u([0-9A-Fa-f]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
-    .replace(/\\x([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
-    .replace(/\\0([0-7]{1,3})/g, (_, o) => String.fromCharCode(parseInt(o, 8)));
-}
-
-// Base64 decode — restricted to parameter-value context only.
-// Previous version decoded ANY 20+ char base64 blob anywhere in text,
-// which caused "semantic mutation" of the input stream.  Now:
-//   - blob must follow = or : (parameter value position)
-//   - minimum 40 chars (filters short tokens, API keys, IDs)
-//   - decoded result must be printable ASCII ≥4 chars
-function base64Decode(str) {
-  return str.replace(
-    /(?:[=:]\s*)([A-Za-z0-9+/]{40,}={0,2})(?:$|[&\s;,\]}])/g,
-    (match, b64) => {
-      try {
-        const decoded = Buffer.from(b64, 'base64').toString('utf-8');
-        if (/^[\x20-\x7E\r\n\t]+$/.test(decoded) && decoded.length >= 4) {
-          return match.replace(b64, decoded);
-        }
-      } catch {}
-      return match;
+/**
+ * Detects duplicate keys in JSON body to prevent smuggling.
+ * FIX: BUG_5 — compares parsed key count with raw matches to handle nesting/escapes
+ */
+function hasDuplicateKeys(jsonStr) {
+  if (typeof jsonStr !== 'string' || !jsonStr.includes('{')) return false;
+  try {
+    const parsed = JSON.parse(jsonStr);
+    const parsedKeyCount = Object.keys(parsed).length;
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let keysAtDepth1 = 0;
+    for (let i = 0; i < jsonStr.length; i++) {
+      const char = jsonStr[i];
+      if (inString) {
+        if (escape) escape = false;
+        else if (char === '\\') escape = true;
+        else if (char === '"') inString = false;
+      } else {
+        if (char === '"') inString = true;
+        else if (char === '{') depth++;
+        else if (char === '}') depth--;
+        else if (char === ':' && depth === 1) keysAtDepth1++;
+      }
     }
-  );
+    return keysAtDepth1 > parsedKeyCount;
+  } catch {
+    return false;
+  }
 }
 
-function removeNullBytes(str) {
-  return str.replace(/\x00|%00|\0/gi, '');
-}
-
-function normalizePath(str) {
-  return str.replace(/\\/g, '/').replace(/\/+/g, '/');
-}
-
-// Recursive decode — applies all decoders until output stabilizes.
-// Guaranteed to terminate: depth counter + MAX_DECODE_DEPTH = 5.
-function fullDecode(str, depth = 0) {
-  if (!str || typeof str !== 'string' || depth >= MAX_DECODE_DEPTH) return str || '';
-
-  let decoded = str;
-  decoded = removeNullBytes(decoded);
-  decoded = urlDecode(decoded);
-  decoded = htmlEntityDecode(decoded);
-  decoded = unicodeDecode(decoded);
-  decoded = base64Decode(decoded);
-  decoded = normalizePath(decoded);
-
-  return decoded !== str ? fullDecode(decoded, depth + 1) : decoded;
-}
-
-// Builds normalized request copy for rule matching.
-// IMPORTANT: the original req object is never modified — this returns a new object.
-// Raw originals are preserved for evasion detection (rawUrl, rawBody).
+/**
+ * Main entry point for request normalization.
+ */
 function decodeRequest(req) {
   const decoded = {
-    url: fullDecode(req.url || ''),
     method: (req.method || 'GET').toUpperCase(),
-    headers: {},
+    rawUrl: req.url || '/',
+    path: '',
     query: {},
-    body: '',
+    headers: {},
     cookies: {},
-    ip: req.ip || req.connection?.remoteAddress || 'unknown',
-    path: fullDecode(req.path || req.url?.split('?')[0] || ''),
-    rawUrl: req.url || '',
-    rawBody: '',
-    userAgent: '',
-    sessionId: req.sessionId || req.session?.id || req.cookies?.session || null,
-    timestamp: Date.now(),
-    geoip: req.geoip || null,
-    fingerprint: req.fingerprint || null,
-    rate: req.rate || null,
+    body: null,
+    rawBody: req.body || '',
+    ip: req.clientIp || 'unknown'
   };
+
+  try {
+    const url = new URL(req.url || '/', 'http://local');
+    decoded.path = fullDecode(url.pathname, 'path');
+    for (const [k, v] of url.searchParams.entries()) {
+      decoded.query[fullDecode(k, 'queryKey')] = deepDecode(v, 'queryValue');
+    }
+  } catch (e) {
+    const parts = (req.url || '/').split('?');
+    decoded.path = fullDecode(parts[0], 'path');
+  }
 
   if (req.headers) {
     for (const [key, value] of Object.entries(req.headers)) {
-      decoded.headers[key.toLowerCase()] = fullDecode(String(value));
-    }
-    decoded.userAgent = decoded.headers['user-agent'] || '';
-  }
-
-  if (req.query && typeof req.query === 'object') {
-    for (const [key, value] of Object.entries(req.query)) {
-      decoded.query[fullDecode(key)] = fullDecode(String(value));
-    }
-  } else if (req.url && req.url.includes('?')) {
-    const qs = req.url.split('?')[1] || '';
-    for (const pair of qs.split('&')) {
-      const [key, ...rest] = pair.split('=');
-      if (key) decoded.query[fullDecode(key)] = fullDecode(rest.join('='));
+      decoded.headers[key.toLowerCase()] = fullDecode(String(value), 'header');
     }
   }
 
   if (req.body) {
-    if (typeof req.body === 'string') {
-      decoded.body = fullDecode(req.body);
-      decoded.rawBody = req.body;
-    } else if (typeof req.body === 'object') {
-      decoded.rawBody = JSON.stringify(req.body);
-      decoded.body = fullDecode(decoded.rawBody);
-    }
-  }
-
-  if (req.cookies && typeof req.cookies === 'object') {
-    for (const [key, value] of Object.entries(req.cookies)) {
-      decoded.cookies[fullDecode(key)] = fullDecode(String(value));
-    }
-  } else if (req.headers?.cookie) {
-    for (const pair of req.headers.cookie.split(';')) {
-      const [key, ...rest] = pair.trim().split('=');
-      if (key) decoded.cookies[fullDecode(key.trim())] = fullDecode(rest.join('=').trim());
-    }
+    if (hasDuplicateKeys(req.body)) decoded.jsonSmuggling = true;
+    decoded.body = deepDecode(req.body, 'body');
   }
 
   return decoded;
 }
 
-module.exports = {
-  urlDecode, htmlEntityDecode, unicodeDecode, base64Decode,
-  removeNullBytes, normalizePath, fullDecode, decodeRequest,
-};
+/**
+ * Recursively decodes structured data.
+ * FIX: BUG_6 — uses MAX_DECODE_DEPTH constant
+ */
+function deepDecode(value, context, depth = 0) {
+  if (depth >= MAX_DECODE_DEPTH) return value;
+  if (typeof value === 'string') return fullDecode(value, context, depth);
+  if (Array.isArray(value)) return value.map(v => deepDecode(v, context, depth + 1));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([k, v]) => [
+        fullDecode(k, context + 'Key'),
+        deepDecode(v, context, depth + 1)
+      ])
+    );
+  }
+  return value;
+}
+
+/**
+ * Multi-pass context-aware decoder.
+ * FIX: BUG_7 — added length protection between passes
+ */
+function fullDecode(str, context = 'generic', depth = 0) {
+  if (!str || typeof str !== 'string' || depth >= MAX_DECODE_DEPTH) return str || '';
+  
+  let current = str;
+  const checkLen = (s) => s.length > MAX_OUTPUT_LENGTH ? s.slice(0, MAX_OUTPUT_LENGTH) : s;
+
+  // Layer 0: Unicode & Nulls
+  current = checkLen(current.normalize('NFKC').replace(/\0/g, ''));
+
+  // Layer 1: URL Decode
+  const plusAsSpace = ['queryValue', 'queryKey', 'cookie', 'body'].includes(context);
+  const urlDecoded = urlDecode(current, plusAsSpace);
+  current = checkLen(urlDecoded);
+
+  // Layer 2: HTML Entities
+  const htmlDecoded = htmlEntityDecode(current);
+  current = checkLen(htmlDecoded);
+
+  // Layer 3: Unicode Escapes
+  const uniDecoded = unicodeDecode(current);
+  current = checkLen(uniDecoded);
+
+  // Layer 4: Base64 (selective)
+  if (['queryValue', 'body', 'cookie', 'header'].includes(context)) {
+    const b64 = tryDecodeBase64(current);
+    if (b64) return fullDecode(checkLen(b64), context, depth + 1);
+  }
+
+  // Layer 5: Path Normalization
+  if (context === 'path') current = normalizePath(current);
+
+  // Recursion until stable
+  if (current !== str) {
+    if (depth > 2) console.debug(`[decoder] Deep recursion reached for context ${context}`);
+    return fullDecode(current, context, depth + 1);
+  }
+
+  return current;
+}
+
+function urlDecode(str, plusAsSpace) {
+  const input = plusAsSpace ? str.replace(/\+/g, ' ') : str;
+  try { return decodeURIComponent(input); } catch {
+    return input.replace(/%([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+  }
+}
+
+function htmlEntityDecode(str) {
+  return str
+    .replace(/&lt;?/gi, '<').replace(/&gt;?/gi, '>').replace(/&quot;?/gi, '"')
+    .replace(/&#39;?/g, "'").replace(/&amp;?/gi, '&')
+    .replace(/&#x([0-9A-Fa-f]+);?/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&#([0-9]+);?/g, (_, d) => String.fromCharCode(parseInt(d, 10)));
+}
+
+function unicodeDecode(str) {
+  return str
+    .replace(/%u([0-9A-Fa-f]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/\\u\{([0-9A-Fa-f]{1,6})\}/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/\\u([0-9A-Fa-f]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/\\x([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/\\0([0-7]{1,3})/g, (_, o) => String.fromCharCode(parseInt(o, 8)));
+}
+
+/**
+ * Protocol extraction helpers.
+ */
+function getAlpn(req) {
+  return req.socket?.alpnProtocol || req.headers['x-alpn'] || req.headers['cf-alpn'] || (req.httpVersion === '2.0' ? 'h2' : 'http/1.1');
+}
+
+function extractH2Fingerprint(req) {
+  const h = req.headers['x-h2-fingerprint'] || req.headers['ck-h2-settings'];
+  if (h) return h;
+  if (req.httpVersion === '2.0' && req.stream?.session?.originSettings) {
+    const s = req.stream.session.originSettings;
+    return `1:${s.headerTableSize};3:${s.maxConcurrentStreams};4:${s.initialWindowSize}`;
+  }
+  return 'h1';
+}
+
+module.exports = { decodeRequest, fullDecode, deepDecode, getAlpn, extractH2Fingerprint };
+
+// === EXPORTS ===
+/**
+ * @typedef {Object} DecoderModule
+ * @property {Function} decodeRequest - Main normalization entry
+ * @property {Function} fullDecode - Multi-pass string decoder
+ * @property {Function} deepDecode - Recursive object decoder
+ * @property {Function} getAlpn - ALPN protocol extractor
+ * @property {Function} extractH2Fingerprint - H2 settings extractor
+ */

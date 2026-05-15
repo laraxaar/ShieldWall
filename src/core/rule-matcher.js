@@ -133,17 +133,82 @@ function evaluate(node, rule, md) {
 }
 
 /**
- * Iterates across all loaded signatures, evaluating them against the request payload.
+ * Compiles parsed rules into an optimized matching context.
+ * Uses Target Grouping and Aho-Corasick for O(n) fast-path filtering.
+ * @param {Array} rules - Raw parsed rules.
+ * @returns {Object} Compiled matcher context.
+ */
+function compileRules(rules) {
+  const AhoCorasick = require('./aho-corasick');
+  const context = {
+    allRules: rules,
+    targetGroups: {
+      url: [], body: [], headers: [], any: []
+    },
+    aho: new AhoCorasick(),
+    literalRules: new Set(), // Rules that MUST have a literal match to trigger
+  };
+
+  for (const rule of rules) {
+    let hasLiteral = false;
+    let targetCategory = 'any';
+
+    // 1. Grouping by Target to prevent evaluating body rules on empty bodies
+    const targets = Object.values(rule.targets || {});
+    if (targets.every(t => t.includes('body'))) targetCategory = 'body';
+    else if (targets.every(t => t.includes('url') || t.includes('path') || t.includes('query'))) targetCategory = 'url';
+    else if (targets.every(t => t.includes('header') || t.includes('cookie') || t.includes('useragent'))) targetCategory = 'headers';
+
+    context.targetGroups[targetCategory].push(rule);
+
+    // 2. Extract Literal Strings for Aho-Corasick
+    // If all patterns in the rule's condition require specific strings,
+    // and those strings are literals (not regex), we can mandate a fast-path match.
+    for (const [name, def] of Object.entries(rule.strings)) {
+      if (def.type === 'string' && def.value.length >= 3) {
+        // Add literal to Aho-Corasick. Output is the rule reference.
+        context.aho.add(def.nocase ? def.value.toLowerCase() : def.value, rule);
+        hasLiteral = true;
+      }
+    }
+
+    if (hasLiteral) {
+      context.literalRules.add(rule);
+    }
+  }
+
+  context.aho.build();
+  return context;
+}
+
+/**
+ * Iterates across all loaded signatures using Aho-Corasick Fast-Path.
  * Outputs matches acting as 'Signals' for engine.js's Unified Risk Aggregator.
- * @param {Array} rules - Parsed rule objects.
+ * @param {Object} ctx - Compiled Matcher Context.
  * @param {Object} decodedReq - Request data.
  * @returns {Array} List of triggered match objects containing severity and context.
  */
-function matchAllRules(rules, decodedReq) {
+function matchCompiledRules(ctx, decodedReq) {
   const md = prepareMatchData(decodedReq);
   const matches = [];
 
-  for (const rule of rules) {
+  // Determine active rule groups based on request context
+  const activeRules = new Set(ctx.targetGroups.any);
+  ctx.targetGroups.url.forEach(r => activeRules.add(r)); // URL is always present
+  if (md.body) ctx.targetGroups.body.forEach(r => activeRules.add(r));
+  if (md.headerString) ctx.targetGroups.headers.forEach(r => activeRules.add(r));
+
+  // 1. Aho-Corasick Fast Path (O(n) scan over entire payload)
+  const fullPayloadLower = md.full.toLowerCase();
+  const fastPathHits = new Set(ctx.aho.search(fullPayloadLower));
+
+  for (const rule of activeRules) {
+    // Fast-path exclusion: If the rule relies on literals and Aho didn't find ANY, skip AST eval.
+    if (ctx.literalRules.has(rule) && !fastPathHits.has(rule)) {
+      continue;
+    }
+
+    // AST Evaluation (Slow Path)
     if (!evaluate(rule.condition, rule, md)) continue;
 
     const mp = [];
@@ -168,4 +233,4 @@ function matchAllRules(rules, decodedReq) {
   return matches;
 }
 
-module.exports = { prepareMatchData, testPattern, evaluate, matchAllRules, TARGET_MAP };
+module.exports = { prepareMatchData, testPattern, evaluate, compileRules, matchCompiledRules, TARGET_MAP };

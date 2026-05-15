@@ -16,8 +16,10 @@ class BruteForceGuard {
         .map(p => p.toLowerCase())
     );
     this.failedCodes = new Set(options.failedCodes || [401, 403, 422]);
+    this.accountMaxAttempts = options.accountMaxAttempts || 10;
 
     this._state = new Map();
+    this._accountState = new Map();
     this._cleanup = setInterval(() => this._gc(), 60_000);
     this._cleanup.unref?.();
   }
@@ -38,10 +40,35 @@ class BruteForceGuard {
     return { blocked: false, ip };
   }
 
-  recordResponse(req, statusCode) {
+  checkAccount(accountId) {
+    if (!accountId) return { blocked: false };
+    
+    const now = Date.now();
+    const entry = this._accountState.get(accountId);
+    if (!entry) return { blocked: false };
+
+    entry.attempts = entry.attempts.filter(ts => now - ts < this.windowMs);
+
+    if (entry.attempts.length >= this.accountMaxAttempts) {
+      return { 
+        blocked: true, 
+        reason: `Account locked after ${entry.attempts.length} failed attempts globally`,
+        retryAfter: this.blockDurationMs
+      };
+    }
+    return { blocked: false };
+  }
+
+  recordResponse(req, statusCode, accountId = null) {
     const ip = this._ip(req);
     const path = (req.path || req.url?.split('?')[0] || '').toLowerCase();
     if (!this._isSensitive(path)) return;
+
+    if (accountId && this.failedCodes.has(statusCode)) {
+      let accEntry = this._accountState.get(accountId);
+      if (!accEntry) { accEntry = { attempts: [] }; this._accountState.set(accountId, accEntry); }
+      accEntry.attempts.push(Date.now());
+    }
 
     // Successful auth resets the counter
     if (!this.failedCodes.has(statusCode)) { this._state.delete(ip); return; }
@@ -63,14 +90,27 @@ class BruteForceGuard {
   middleware() {
     const guard = this;
     return function(req, res, next) {
-      const r = guard.check(req);
-      if (r.blocked) {
-        res.status(429).setHeader('Retry-After', Math.ceil(r.retryAfter / 1000));
-        res.json({ error: 'Too Many Failed Attempts', retryAfter: Math.ceil(r.retryAfter / 1000) });
+      const rIp = guard.check(req);
+      
+      let accountId = null;
+      if (req.body && typeof req.body === 'object') {
+        accountId = req.body.email || req.body.username || req.body.account || null;
+      }
+      
+      const rAcc = guard.checkAccount(accountId);
+      
+      if (rIp.blocked || rAcc.blocked) {
+        const retryAfter = rIp.blocked ? rIp.retryAfter : rAcc.retryAfter;
+        // TARPIT: Add a 2-5 second delay to ruin bruteforce throughput
+        const delay = 2000 + Math.random() * 3000;
+        setTimeout(() => {
+          res.status(429).setHeader('Retry-After', Math.ceil(retryAfter / 1000));
+          res.json({ error: 'Too Many Failed Attempts', retryAfter: Math.ceil(retryAfter / 1000) });
+        }, delay);
         return;
       }
       const origEnd = res.end.bind(res);
-      res.end = function(c, e) { guard.recordResponse(req, res.statusCode); return origEnd(c, e); };
+      res.end = function(c, e) { guard.recordResponse(req, res.statusCode, accountId); return origEnd(c, e); };
       next();
     };
   }
@@ -94,6 +134,10 @@ class BruteForceGuard {
     for (const [ip, e] of this._state) {
       e.attempts = e.attempts.filter(ts => now - ts < this.windowMs);
       if (!e.attempts.length && (!e.blockUntil || now >= e.blockUntil)) this._state.delete(ip);
+    }
+    for (const [acc, e] of this._accountState) {
+      e.attempts = e.attempts.filter(ts => now - ts < this.windowMs);
+      if (!e.attempts.length) this._accountState.delete(acc);
     }
   }
 

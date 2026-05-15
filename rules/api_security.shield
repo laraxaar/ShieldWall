@@ -6,7 +6,7 @@ rule anomalous_content_type : api {
     meta:
         author      = "laraxaar"
         description = "Unexpected Content-Type for API endpoint — possible parser confusion attack"
-        severity    = "low"
+        severity    = "info"
 
     target:
         $headers = request.headers
@@ -21,5 +21,5 @@ rule anomalous_content_type : api {
         $api_slash = /api\//i
 
     condition:
-        ($xml_content and $json_api) or ($form_content and $api_v) or ($plain_content and $api_slash)
+        ($xml_content and $json_api) or ($form_content and $api_v)
 }

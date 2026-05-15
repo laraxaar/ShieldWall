@@ -10,3 +10,14 @@ dist/
 
 *.bak
 *.tmp
+
+# Excluded tests and demos
+anomaly.test.js
+smart-anomaly-demo.js
+
+# Go Gateway
+gateway/certs/
+gateway/shieldwall-gateway
+gateway/shieldwall-gateway.exe
+
+anomaly.test.js

@@ -76,10 +76,32 @@ function applyConfig(defaults, user) {
   return conf;
 }
 
+const crypto = require('crypto');
+
 function createMiddleware(userConfig = {}) {
   const c = applyConfig(DEFAULTS, userConfig);
-  return function securityHeaders(_req, res) {
-    if (c.contentSecurityPolicy?.enabled) res.setHeader('Content-Security-Policy', buildCSP(c.contentSecurityPolicy.directives));
+  return function securityHeaders(req, res, next) {
+    if (c.contentSecurityPolicy?.enabled) {
+      const nonce = crypto.randomBytes(16).toString('base64');
+      res.locals = res.locals || {};
+      res.locals.cspNonce = nonce;
+      
+      const directives = JSON.parse(JSON.stringify(c.contentSecurityPolicy.directives));
+      if (directives['script-src']) {
+        directives['script-src'] = directives['script-src'].filter(v => v !== "'unsafe-inline'");
+        directives['script-src'].push(`'nonce-${nonce}'`);
+      }
+      res.setHeader('Content-Security-Policy', buildCSP(directives));
+    }
+
+    if (c.contentSecurityPolicy?.reportUri) {
+      res.setHeader('Report-To', JSON.stringify({
+        group: 'csp-violations',
+        max_age: 10886400,
+        endpoints: [{ url: c.contentSecurityPolicy.reportUri }]
+      }));
+    }
+
     if (c.hsts?.enabled) {
       let v = `max-age=${c.hsts.maxAge}`; if (c.hsts.includeSubDomains) v += '; includeSubDomains'; if (c.hsts.preload) v += '; preload';
       res.setHeader('Strict-Transport-Security', v);
@@ -96,6 +118,8 @@ function createMiddleware(userConfig = {}) {
     if (c.crossOriginOpenerPolicy) res.setHeader('Cross-Origin-Opener-Policy', c.crossOriginOpenerPolicy);
     if (c.crossOriginResourcePolicy) res.setHeader('Cross-Origin-Resource-Policy', c.crossOriginResourcePolicy);
     if (c.removeHeaders) c.removeHeaders.forEach(h => res.removeHeader(h));
+    
+    if (typeof next === 'function') next();
   };
 }
 
