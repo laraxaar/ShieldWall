@@ -1,6 +1,6 @@
 rule java_deserialization : deserialization {
     meta:
-        author      = "laraxaar"
+        author      = "shieldwall-core"
         description = "Java insecure deserialization detection"
         severity    = "critical"
 
@@ -23,7 +23,7 @@ rule java_deserialization : deserialization {
 
 rule php_deserialization : deserialization {
     meta:
-        author      = "laraxaar"
+        author      = "shieldwall-core"
         description = "PHP object injection and deserialization attacks"
         severity    = "critical"
 
@@ -47,7 +47,7 @@ rule php_deserialization : deserialization {
 
 rule nodejs_deserialization : deserialization {
     meta:
-        author      = "laraxaar"
+        author      = "shieldwall-core"
         description = "Node.js prototype pollution and deserialization attacks"
         severity    = "critical"
 
@@ -68,7 +68,7 @@ rule nodejs_deserialization : deserialization {
 
 rule python_deserialization : deserialization {
     meta:
-        author      = "laraxaar"
+        author      = "shieldwall-core"
         description = "Python pickle and YAML deserialization attacks"
         severity    = "critical"
 

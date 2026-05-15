@@ -3,12 +3,17 @@
   "version": "1.0.0",
   "description": "🛡️ YARA-like WAF engine for Node.js — protect your web apps with custom .shield rules",
   "main": "src/index.js",
+  "bin": {
+    "shieldwall": "src/cli.js"
+  },
   "scripts": {
     "test": "jest --verbose --coverage",
     "test:watch": "jest --watch",
     "lint": "eslint src/ test/",
     "example": "node examples/express-basic.js",
-    "example:dashboard": "node examples/express-dashboard.js"
+    "example:dashboard": "node examples/express-dashboard.js",
+    "example:lab": "node src/playground/server.js",
+    "test:stress": "node src/playground/stresser.js"
   },
   "keywords": [
     "waf",

@@ -5,19 +5,30 @@
  * @description Core Security Orchestrator for ShieldWall WAF.
  * Acts as the primary decision engine unifying signatures, behavioral heuristics, and rate limiting.
  *
+ * ROLE IN ARCHITECTURE:
+ * Central brain that sequences the request through 12 analysis layers (Go TLS -> Decoder -> Modules -> Rules).
+ * It aggregates risk scores from independent modules and applies cross-module signal boosting.
+ *
  * @dependencies
  * - `decoder.js`: Input normalization payload unpacking.
  * - `rule-parser.js` & `rule-matcher.js`: YARA-inspired signature evaluation.
  * - `reputation.js`: Time-decaying threat intelligence store (used for FP Circuit Breakers).
- * 
+ * - `recon-tracker.js`: Reconnaissance-to-Exploit correlation engine (Kill Chain detection).
+ *
  * @flow
  * 1. Intakes raw HTTP requests (`req`).
  * 2. `_extractIP`: Computes real IP handling proxy topologies.
  * 3. `decodeRequest`: Unrolls encodings (URL, base64, HTML entities).
  * 4. Extracts Signals: Runs Detectors concurrently (Modules + .shield rules).
  * 5. Risk Aggregation: Combines signals weighted by Action Sensitivity (Context).
- * 6. Circuit Breaker: Evaluates history to prevent False Positives for established users.
- * 7. Policy Enforcement: Blocks or logs.
+ * 6. Recon Correlation: Checks IP taint from reconnaissance tracker.
+ * 7. Circuit Breaker: Evaluates history to prevent False Positives for established users.
+ * 8. Policy Enforcement: Blocks or logs.
+ *
+ * CRITICAL FALSE POSITIVE (FP) MITIGATION:
+ * - Action Sensitivity Context: Multiplies risk only for critical endpoints (auth/admin).
+ * - Reputation Circuit Breaker: Discounts risk for established, trust-verified users.
+ * - Feedback Loop: Integrates backend latency and response codes to refine verdicts.
  */
 
 const { EventEmitter } = require('events');
@@ -29,6 +40,9 @@ const { parseRules, loadRulesFromDir } = require('./rule-parser');
 const { matchAllRules } = require('./rule-matcher');
 const Logger = require('./logger');
 const ReportingEngine = require('./reporting');
+const MitigationEngine = require('./mitigation');
+const Advisor = require('./advisor');
+const { recordReconAttempt, getReputationTaint, isSensitiveTarget } = require('./recon-tracker');
 
 const DEFAULT_RULES_DIR = path.join(__dirname, '..', '..', 'rules');
 const SEVERITY_PRIORITY = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
@@ -88,9 +102,12 @@ class ShieldWallEngine extends EventEmitter {
       level: this.options.logLevel,
       silent: this.options.silent,
       json: this.options.jsonLogs,
+      siemWebhook: options.siemWebhook || null,
       maxHistory: options.maxHistory || 10000,
       onEvent: (event) => this.emit('log', event),
     });
+
+    this.mitigation = new MitigationEngine(options.mitigation || {});
 
     this.rules = [];
     this._loadRules();
@@ -116,6 +133,29 @@ class ShieldWallEngine extends EventEmitter {
       rulesLoaded: this.rules.length,
       modulesActive: this.modules.map(m => m.name),
     });
+
+    this._setupClusterSync();
+  }
+
+  /**
+   * Synchronizes internal state across Node.js worker processes via IPC.
+   */
+  _setupClusterSync() {
+    if (typeof process.send !== 'function') return;
+
+    process.on('message', (msg) => {
+      if (msg?.type === 'SHIELDWALL_SYNC_ATTACK') {
+        // Sync attack from another worker into local logger (without triggering re-emit)
+        this.logger._store(msg.data);
+      }
+    });
+
+    this.on('threat', (event) => {
+      process.send({
+        type: 'SHIELDWALL_SYNC_ATTACK',
+        data: event
+      });
+    });
   }
 
   /**
@@ -131,6 +171,27 @@ class ShieldWallEngine extends EventEmitter {
       if (ips.length > 0) return ips[0];
     }
     return req.ip || req.connection?.remoteAddress || req.socket?.remoteAddress || 'unknown';
+  }
+
+  /**
+   * @file rule-parser.js
+   * @description .shield DSL Lexer & Recursive-Descent Parser.
+   * 
+   * ROLE IN ARCHITECTURE:
+   * Compiles human-readable .shield rule files into an Abstract Syntax Tree (AST)
+   * for high-performance execution by the rule-matcher.
+   */
+  reloadRules() {
+    this.logger.info('Hot-reloading rules...');
+    this.rules = [];
+    this._loadRules();
+
+    // Also notify modules that might be caching rule data (like smart-anomaly)
+    for (const mod of this.modules) {
+      if (typeof mod.module?.reload === 'function') {
+        try { mod.module.reload(); } catch (e) { }
+      }
+    }
   }
 
   /**
@@ -154,7 +215,16 @@ class ShieldWallEngine extends EventEmitter {
 
     if (this.options.customRules) {
       try { this.rules.push(...parseRules(this.options.customRules)); }
-      catch (err) { this.logger.error(`Error parsing inline rules: ${err.message}`); }
+      catch (err) { this.logger.error(`Error loading inline custom rules: ${err.message}`); }
+    }
+
+    // Aho-Corasick Compilation for Fast-Path routing
+    try {
+      const { compileRules } = require('./rule-matcher');
+      this.compiledRuleContext = compileRules(this.rules);
+      this.logger.info(`Engine compiled ${this.rules.length} rules into Aho-Corasick context.`);
+    } catch (err) {
+      this.logger.error(`Aho-Corasick rule compilation failed: ${err.message}`);
     }
   }
 
@@ -174,6 +244,7 @@ class ShieldWallEngine extends EventEmitter {
       ddosProtection: '../modules/ddos-protection',
       fingerprinter: '../modules/fingerprinter',
       reputation: '../modules/reputation',
+      adaptiveBaselines: '../modules/adaptive-baselines',
     };
 
     for (const [name, modulePath] of Object.entries(map)) {
@@ -191,50 +262,172 @@ class ShieldWallEngine extends EventEmitter {
   /**
    * Central evaluation loop: Processes the request against all security layers.
    * @param {Object} req - The raw HTTP request object.
-   * @returns {Promise<Object>} The verdict map including { blocked, matches, riskScore }.
+   * @param {Object} [options] - Analysis options (e.g. { trace: true }).
+   * @returns {Promise<Object>} The verdict map including { blocked, matches, riskScore, trace }.
    */
-  async analyze(req) {
+  async analyze(req, res, opts = {}) {
+    const startOverall = process.hrtime.bigint();
+    const reqStartMs = Date.now();
     this.stats.totalRequests++;
-    
-    // Dynamically patch the core IP address on the request before downstream handling
+
+    const trace = [];
+    const addTrace = (step, data) => {
+      const now = process.hrtime.bigint();
+      const elapsed = Number(now - startOverall) / 1e6; // ms
+      trace.push({ step, data, ms: elapsed.toFixed(3) });
+    };
+
+    addTrace('engine_entry', { method: req.method, url: req.url, ip: req.ip });
+
     req.clientIp = this._extractIP(req);
+    addTrace('ip_resolved', { ip: req.clientIp });
 
-    if (this._isExcluded(req)) return { blocked: false, matches: [], decodedReq: null, riskScore: 0 };
-
-    // Deep Decode Payload (Removes traversal evasion attempts)
-    const decodedReq = decodeRequest(req);
-    // Sync the patched IP into the decoded request state
-    decodedReq.ip = req.clientIp;
-
-    const allMatches = [];
-
-    // Parallel execution slice: All detectors evaluate simultaneously 
-    const modulePromises = this.modules.map(async (mod) => {
-      try {
-        return await mod.check(decodedReq);
-      } catch (err) {
-        this.logger.error(`Detector "${mod.name}" failure: ${err.message}`);
-        return null; // Silent catch: Resilient pipeline design ensures one failing module doesn't crash WAF
-      }
-    });
-
-    const moduleResults = await Promise.all(modulePromises);
-    for (const results of moduleResults) {
-      if (results?.length) allMatches.push(...results);
+    if (this._isExcluded(req)) {
+      addTrace('engine_exit', { reason: 'whitelist_match' });
+      return { blocked: false, matches: [], decodedReq: null, riskScore: 0, trace };
     }
 
-    allMatches.push(...matchAllRules(this.rules, decodedReq));
+    addTrace('decoding_start', { rawUrl: req.url, bodyType: typeof req.body });
+
+    // Unification: Ensure body is a string (prevents Crash-on-JSON)
+    let rawBodyStr = typeof req.body === 'object' ? JSON.stringify(req.body) : (req.body || "");
+
+    // Padding/ReDoS protection: Collapse spaces and limit size
+    if (rawBodyStr.length > 512 * 1024) {
+      rawBodyStr = rawBodyStr.slice(0, 512 * 1024);
+    }
+    // Collapse excessive whitespace to prevent ReDoS on massive padding
+    rawBodyStr = rawBodyStr.replace(/\s{10,}/g, ' ');
+
+    req.body = rawBodyStr;
+
+    const decodedReq = decodeRequest(req);
+
+    if (res && typeof res.writeHead === 'function' && !res._reconHooked) {
+      res._reconHooked = true;
+      const originalWriteHead = res.writeHead;
+      res.writeHead = function(statusCode) {
+        if (statusCode === 404 || statusCode === 403) {
+          recordReconAttempt(req.clientIp, decodedReq.path, statusCode);
+        }
+        originalWriteHead.apply(res, arguments);
+      };
+    }
+
+    if (/(\/\.env|\/wp-admin|\/actuator)/i.test(decodedReq.path)) {
+      recordReconAttempt(req.clientIp, decodedReq.path, 404);
+    }
+
+    // Ensure decoded body is a string for modules (Crash-on-JSON fix)
+    if (typeof decodedReq.body === 'object' && decodedReq.body !== null) {
+      decodedReq.body = JSON.stringify(decodedReq.body);
+    }
+
+    decodedReq.ip = req.clientIp;
+    addTrace('decoding_complete', {
+      path: decodedReq.path,
+      queryKeys: Object.keys(decodedReq.query),
+      bodyType: typeof decodedReq.body,
+      jsonSmuggling: !!decodedReq.jsonSmuggling
+    });
+
+    const allMatches = [];
+    let cumulativeRiskScore = 0;
+
+    // 2. Protocol Anomaly Check
+    const allowedMethods = ['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS', 'PATCH'];
+    if (!allowedMethods.includes(decodedReq.method)) {
+      allMatches.push({
+        rule: 'protocol_anomaly:verb_tampering',
+        severity: 'high',
+        category: 'bypass',
+        description: `Unusual HTTP method detected: ${decodedReq.method}`
+      });
+      cumulativeRiskScore += 30; // High severity score
+    }
+
+    if (decodedReq.jsonSmuggling) {
+      allMatches.push({
+        rule: 'protocol_anomaly:json_smuggling',
+        severity: 'critical',
+        category: 'zero-day',
+        description: 'Duplicate keys detected in JSON body'
+      });
+      cumulativeRiskScore += 50; // Critical severity score
+    }
+
+    // Check for large headers (Buffer Overflow / DoS protection)
+    const totalHeaderSize = Object.values(req.headers || {}).join('').length;
+    if (totalHeaderSize > 16384) {
+      allMatches.push({
+        rule: 'protocol_anomaly:oversized_headers',
+        severity: 'critical',
+        category: 'dos',
+        description: `Oversized headers detected (${totalHeaderSize} bytes)`
+      });
+      cumulativeRiskScore += 50;
+    }
+
+    for (const mod of this.modules) {
+      const modStart = process.hrtime.bigint();
+      try {
+        const matches = await mod.check(decodedReq);
+        const modEnd = process.hrtime.bigint();
+        const modMs = Number(modEnd - modStart) / 1e6;
+
+        addTrace('module_exec', {
+          name: mod.name,
+          matches: matches?.length || 0,
+          durationMs: modMs.toFixed(3)
+        });
+
+        if (matches && matches.length > 0) {
+          allMatches.push(...matches);
+          for (const match of matches) {
+            if (match.score) cumulativeRiskScore += match.score;
+            else if (match.severity === 'critical') cumulativeRiskScore += 30;
+            else if (match.severity === 'high') cumulativeRiskScore += 15;
+            else if (match.severity === 'medium') cumulativeRiskScore += 7;
+            else cumulativeRiskScore += 2;
+          }
+        }
+      } catch (err) {
+        addTrace('module_error', { name: mod.name, error: err.message });
+        this.logger.error(`Module ${mod.name} failed:`, err);
+      }
+    }
+
+    addTrace('rule_matching_start', { ruleCount: this.rules.length });
+    const { matchCompiledRules } = require('./rule-matcher');
+    const ruleMatches = this.compiledRuleContext
+      ? matchCompiledRules(this.compiledRuleContext, decodedReq)
+      : [];
+    if (ruleMatches.length > 0) {
+      addTrace('rule_matches', { count: ruleMatches.length, matches: ruleMatches });
+      allMatches.push(...ruleMatches);
+      for (const m of ruleMatches) {
+        if (m.severity === 'critical') cumulativeRiskScore += 30;
+        else if (m.severity === 'high') cumulativeRiskScore += 15;
+        else if (m.severity === 'medium') cumulativeRiskScore += 7;
+        else cumulativeRiskScore += 2;
+      }
+    }
 
     // Fast fail check: Save CPU if payload is fully clean
-    if (!allMatches.length) return { blocked: false, matches: [], decodedReq, riskScore: 0 };
+    if (!allMatches.length) {
+      if (this.options.logging?.level === 'debug') {
+        this.logger.info(`Clean request processed: ${decodedReq.method} ${decodedReq.rawUrl}`, { trace });
+      }
+      return { blocked: false, matches: [], decodedReq, riskScore: 0, trace };
+    }
 
     /**
      * RISK AGGREGATION ENGINE (Deep Dive)
      * Maps extracted anomaly signals against Endpoint Complexity Constraints.
      */
     const sensitivity = this._getEndpointSensitivity(decodedReq.path || decodedReq.url || '');
-    let cumulativeRiskScore = 0;
-    
+    cumulativeRiskScore = 0; // Reset for sensitivity-weighted calculation
+
     for (const match of allMatches) {
       let baseCost = 0;
       if (typeof match.score === 'number' && match.score > 0) {
@@ -243,6 +436,35 @@ class ShieldWallEngine extends EventEmitter {
         baseCost = SEVERITY_WEIGHTS[match.severity] || 0;
       }
       cumulativeRiskScore += (baseCost * sensitivity);
+    }
+
+    // --- Cross-Module Signal Boosting ---
+    const categoryHits = new Set(allMatches.map(m => m.category || (m.rule ? m.rule.split(':')[0] : 'unknown')));
+
+    if (categoryHits.size >= 3) {
+      cumulativeRiskScore *= 1.5;
+    }
+    if (categoryHits.size >= 4) {
+      cumulativeRiskScore *= 2.0;
+    }
+
+    const isBot = allMatches.some(m => m.rule?.includes('fingerprinter') || m.rule?.includes('bot'));
+    const hasPayloadAnomaly = allMatches.some(m => m.rule?.includes('anomaly') || m.rule?.includes('injection'));
+    if (isBot && hasPayloadAnomaly) {
+      cumulativeRiskScore *= 1.8;
+    }
+    // --- End Boosting ---
+
+    // --- APT Kill Chain Correlation ---
+    const ipTaint = getReputationTaint(decodedReq.ip);
+    if (ipTaint > 15 && isSensitiveTarget(decodedReq.path)) {
+      cumulativeRiskScore += ipTaint; // Full penalty application
+      allMatches.push({
+        rule: 'recon_to_exploit_correlation',
+        severity: 'high',
+        category: 'apt_sequence',
+        description: `Zero-Day risk: Exploitation attempt on sensitive endpoint after reconnaissance (Taint: ${ipTaint})`
+      });
     }
 
     let dynamicBlockThreshold = this.options.blockThreshold;
@@ -256,55 +478,161 @@ class ShieldWallEngine extends EventEmitter {
       try {
         const { getReputation } = require('../modules/reputation');
         const userRep = getReputation(decodedReq.ip);
-        
+
         // If they have 0 incidents and their history spans more than 6 hours, give them leeway
         if (userRep.score === 0 && userRep.firstSeen) {
-           const historyHours = (Date.now() - userRep.firstSeen) / (1000 * 60 * 60);
-           if (historyHours > 6) {
-              dynamicBlockThreshold = Math.floor(dynamicBlockThreshold * 1.5); // 50% leniency bonus (Circuit Breaker)
-           }
+          const historyHours = (Date.now() - userRep.firstSeen) / (1000 * 60 * 60);
+          if (historyHours > 6) {
+            dynamicBlockThreshold = Math.floor(dynamicBlockThreshold * 1.5); // 50% leniency bonus (Circuit Breaker)
+          }
         }
       } catch (e) {
         // Suppress reputation link errors
       }
     }
 
-    const blocked = this.options.mode === 'block' && cumulativeRiskScore >= dynamicBlockThreshold;
+    const blockedByScore = this.options.mode === 'block' && cumulativeRiskScore >= dynamicBlockThreshold;
     const highestSeverity = this._getHighestSeverity(allMatches);
 
-    for (const match of allMatches) {
-      this.logger.attack({
-        blocked,
-        rule: match.rule,
-        severity: match.severity,
-        category: match.category,
+    if (res && typeof res.on === 'function') {
+      res.on('finish', () => {
+        const duration = Date.now() - reqStartMs;
+        const statusCode = res.statusCode || 200;
+
+        // 1. Blind Injection
+        if (duration > 3000 && cumulativeRiskScore > 5 && cumulativeRiskScore < dynamicBlockThreshold) {
+          try {
+            require('../modules/reputation').record(decodedReq.ip, 'blind_sqli', 'high');
+            this.logger.warn(`Blind injection suspected: Backend delay ${duration}ms on low-score request from ${decodedReq.ip}`);
+          } catch (e) { }
+        }
+
+        // 2. Error Spike (Crash Analysis)
+        if (statusCode >= 500) {
+          if (!this.errorCache) this.errorCache = new Map();
+          const errorKey = `errors:${decodedReq.ip}`;
+          const errorCount = (this.errorCache.get(errorKey) || 0) + 1;
+          this.errorCache.set(errorKey, errorCount);
+
+          if (errorCount > 5) {
+            this.logger.warn(`Error spike anomaly: IP ${decodedReq.ip} generated ${errorCount} 500 errors. Possible DoS or Fuzzing.`);
+            try { require('../modules/reputation').record(decodedReq.ip, 'error_spike', 'high'); } catch (e) { }
+          }
+          if (this.errorCache.size > 5000) this.errorCache.delete(this.errorCache.keys().next().value);
+        }
+
+        // 3. Exfiltration Detection
+        const contentLength = parseInt(res.getHeader ? res.getHeader('content-length') : 0, 10) || 0;
+        if (contentLength > 0 && typeof require === 'function') {
+          try {
+            const bl = require('../modules/adaptive-baselines').getBaseline(decodedReq.path || '/');
+            if (bl) {
+              bl.avgResponseSize = bl.avgResponseSize ? bl.avgResponseSize * 0.9 + contentLength * 0.1 : contentLength;
+              if (contentLength > bl.avgResponseSize * 10 && contentLength > 100000) {
+                this.logger.warn(`Exfiltration suspected: Response size ${contentLength} exceeds baseline ${Math.round(bl.avgResponseSize)} for ${decodedReq.path}`);
+                require('../modules/reputation').record(decodedReq.ip, 'data_exfiltration', 'high');
+              }
+            }
+          } catch (e) { }
+        }
+      });
+    }
+
+    const traceId = crypto.randomUUID();
+    const startTime = Date.now();
+
+    const event = {
+      traceId,
+      riskScore: cumulativeRiskScore,
+      highestSeverity,
+      matches: allMatches,
+      request: {
         ip: decodedReq.ip,
         method: decodedReq.method,
         url: decodedReq.rawUrl,
-        description: match.description,
-        matchedPattern: this._formatEvidence(match),
-        analysis: match.analysis || null,
-      });
-
-      if (this.options.modules.reputation !== false) {
-        try {
-          const { record } = require('../modules/reputation');
-          record(decodedReq.ip, match.category, match.severity);
-        } catch {}
+        userAgent: decodedReq.userAgent,
       }
+    };
 
-      this._generateAutoRule(match, decodedReq);
+    // Active Mitigation Check
+    const mitigationAction = this.mitigation.process(req, res, event);
+    const blocked = blockedByScore || mitigationAction?.type === 'block';
+
+    const finalEvent = {
+      timestamp: new Date().toISOString(),
+      blocked,
+      riskScore: cumulativeRiskScore,
+      highestSeverity: highestSeverity,
+      request: {
+        ip: decodedReq.ip,
+        method: decodedReq.method,
+        url: decodedReq.rawUrl,
+        userAgent: req.headers['user-agent'] || 'none'
+      },
+      matches: allMatches,
+      trace
+    };
+
+    // LOG EVERY SNEEZE (Always call attack() for full trace logging)
+    this.logger.attack(finalEvent);
+
+    if (this.options.modules.reputation !== false && blocked) {
+      try {
+        const { record } = require('../modules/reputation');
+        record(decodedReq.ip, allMatches[0]?.category || 'unknown', highestSeverity);
+      } catch { }
+    }
+
+    if (this.options.autoRules !== false && blocked) {
+      for (const match of allMatches) {
+        this._generateAutoRule(match, decodedReq);
+      }
     }
 
     this.stats.detectedThreats += allMatches.length;
     if (blocked) this.stats.blockedRequests++;
 
-    this.emit('threat', {
-      blocked, matches: allMatches, highestSeverity, riskScore: cumulativeRiskScore,
-      request: { ip: decodedReq.ip, method: decodedReq.method, url: decodedReq.rawUrl, userAgent: decodedReq.userAgent },
-    });
+    if (allMatches.length > 0) {
+      this.emit('threat', { ...event, blocked, mitigation: mitigationAction });
+    }
 
-    return { blocked, matches: allMatches, decodedReq, highestSeverity, riskScore: cumulativeRiskScore };
+    // Handle Throttling (Blocking delay)
+    if (mitigationAction?.type === 'throttle' && !blocked) {
+      await new Promise(resolve => setTimeout(resolve, mitigationAction.delay));
+    }
+
+    return {
+      blocked,
+      riskScore: cumulativeRiskScore,
+      highestSeverity: highestSeverity,
+      matches: allMatches,
+      decodedReq,
+      mitigation: mitigationAction,
+      trace
+    };
+  }
+
+  /**
+   * DLP (Data Loss Prevention) Scanner
+   * Analyzes response bodies for sensitive data leakage.
+   */
+  analyzeResponse(body) {
+    const patterns = [
+      { name: 'dlp:system-files', regex: /root:x:0:0|\[boot loader\]/i, severity: 'critical' },
+      { name: 'dlp:credentials', regex: /password\s*[:=]\s*[^\s,]{4,}/i, severity: 'high' },
+      { name: 'dlp:credit-card', regex: /\b(?:\d[ -]*?){13,16}\b/, severity: 'medium' },
+      { name: 'dlp:private-key', regex: /-----BEGIN (RSA|EC|OPENSSH) PRIVATE KEY-----/, severity: 'critical' }
+    ];
+
+    const matches = [];
+    if (typeof body !== 'string') return matches;
+
+    for (const p of patterns) {
+      if (p.regex.test(body)) {
+        matches.push({ rule: p.name, severity: p.severity, description: 'Sensitive data detected in response' });
+      }
+    }
+    return matches;
   }
 
   /**
@@ -345,9 +673,9 @@ class ShieldWallEngine extends EventEmitter {
    */
   _getHighestSeverity(matches) {
     let h = 'info', hp = 0;
-    for (const m of matches) { 
-      const p = SEVERITY_PRIORITY[m.severity] || 0; 
-      if (p > hp) { hp = p; h = m.severity; } 
+    for (const m of matches) {
+      const p = SEVERITY_PRIORITY[m.severity] || 0;
+      if (p > hp) { hp = p; h = m.severity; }
     }
     return h;
   }
@@ -362,6 +690,24 @@ class ShieldWallEngine extends EventEmitter {
       if (rule.pattern.test(path)) return rule.multiplier;
     }
     return 1.0;
+  }
+
+  _formatGeo(geo) {
+    if (!geo) return 'Unknown (Local/Internal)';
+    const parts = [];
+    if (geo.country) parts.push(geo.country);
+    if (geo.city) parts.push(`(${geo.city})`);
+    if (geo.asn) parts.push(`AS${geo.asn}`);
+    if (geo.org) parts.push(geo.org);
+    return parts.length ? parts.join(' ') : 'Unknown';
+  }
+
+  _detectDevice(ua) {
+    if (!ua) return 'unknown';
+    const l = ua.toLowerCase();
+    if (/mobile|android|iphone|ipad|phone/i.test(l)) return 'mobile';
+    if (/tablet|kindle|playbook/i.test(l)) return 'tablet';
+    return 'desktop';
   }
 
   /**
@@ -440,7 +786,7 @@ class ShieldWallEngine extends EventEmitter {
     try {
       fs.appendFileSync(rulesFile, ruleText, 'utf8');
       this.logger.info(`Auto-generated new shield rule: ${ruleId}`);
-      
+
       this.rules.push(...parseRules(ruleText));
     } catch (err) {
       this.logger.error(`Failed to auto-generate rule: ${err.message}`);
@@ -454,7 +800,7 @@ class ShieldWallEngine extends EventEmitter {
     if (this.reporting) this.reporting.destroy();
     for (const mod of this.modules) {
       if (typeof mod.module?.destroy === 'function') {
-        try { mod.module.destroy(); } catch (e) {}
+        try { mod.module.destroy(); } catch (e) { }
       }
     }
     this.removeAllListeners();

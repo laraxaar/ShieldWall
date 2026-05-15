@@ -112,6 +112,10 @@ class Lexer {
         else { this.tokens.push({ type: TOKEN.IDENTIFIER, value: val, line }); }
         continue;
       }
+
+      // Robust fallback: Skip common symbols that might cause Lexer errors if regex fails
+      if (ch === ',' || ch === ';' || ch === '[' || ch === ']') { this.advance(); continue; }
+
       this.error(`Unexpected character: '${ch}'`);
     }
     this.tokens.push({ type: TOKEN.EOF, line: this.line });

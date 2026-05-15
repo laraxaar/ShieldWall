@@ -5,11 +5,11 @@
   <img src="https://img.shields.io/badge/status-alpha-yellow" alt="Status">
 </p>
 
-<h1 align="center">🛡️ ShieldWall</h1>
+<h1 align="center">🛡️ ShieldWall Next-Gen</h1>
 
 <p align="center">
-  <b>YARA-like WAF Engine for Node.js</b><br>
-  <i>Behavioral anomaly detection + custom <code>.shield</code> rules for HTTP traffic</i>
+  <b>EDR-level Web Application Firewall for Node.js</b><br>
+  <i>Context-aware security engine with Stateful Session Analysis & Behavioral Fingerprinting</i>
 </p>
 
 ---
@@ -30,16 +30,23 @@ ShieldWall takes a **layered approach** instead of trying to enumerate every
 known attack signature:
 
 ```
-HTTP Request
+HTTP Request (Gateway)
   │
-  ├─ 1. Multi-layer Decoder     URL / HTML / Unicode / Base64 / null bytes
-  ├─ 2. Anomaly Scoring         character distribution, encoding depth, structural oddities
-  ├─ 3. Honeypot Traps          invisible forms, fake endpoints, bot detection
-  ├─ 4. Baseline Patterns       minimal structural patterns as safety net
-  ├─ 5. .shield Rule Engine     YARA-inspired DSL for custom detection logic
-  ├─ 6. Rate Limiter            sliding window per-IP
-  ├─ 7. Brute-Force Guard       progressive backoff on auth endpoints
-  └─ 8. Security Headers        CSP, HSTS, X-Frame-Options, etc.
+  ├─ 1. TLS Interception         JA3/JA4 extraction, Client Random entropy, GREASE detection
+  │
+Request Payload (Engine)
+  │
+  ├─ 2. Multi-layer Decoder      URL / HTML / Unicode / Base64 normalization
+  ├─ 3. Anomaly Scoring          N-Gram deviation, Shannon entropy, SSTI, Prototype Pollution
+  ├─ 4. Adaptive Baselines       Per-parameter profiling (EWMA length/type tracking)
+  ├─ 5. Session EDR (Stateful)   Request Lineage (Graph), BOLA/IDOR tracking
+  ├─ 6. Sequence Analysis        Mathematical scraping & ID enumeration detection
+  ├─ 7. Honeypot Traps           Invisible forms, fake endpoints, bot detection
+  ├─ 8. .shield Rule Engine      YARA-inspired DSL for custom logic
+  ├─ 9. Rate Limiter             Sliding window per-IP & Brute-force guard
+  ├─ 10. Cross-Module Boosting   Non-linear risk aggregation (Bot + Payload)
+  ├─ 11. Feedback Loop           Backend Timing (Blind SQLi) & Exfiltration detection
+  └─ 12. Security Headers        CSP, HSTS, X-Frame-Options, Permissions-Policy
 ```
 
 The key insight: instead of hardcoding thousands of exploit payloads, ShieldWall
@@ -195,7 +202,20 @@ Rules can be loaded from files, directories, or inline strings — see examples.
 | **Brute-Force Guard** | Progressive backoff on sensitive endpoints |
 | **Security Headers** | CSP, HSTS, Permissions-Policy, etc. (helmet.js alternative) |
 | **Bot Detection** | Headless browser detection, automation tools, behavioral analysis |
-| **Session Anomaly** | Geo-velocity checks, device fingerprint changes, impossible travel detection |
+| **Session Anomaly** | 
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║                ShieldWall Session EDR (Stateful)                         ║
+// ║                                                                         ║
+// ║  Provides high-level context awareness similar to Endpoint Detection     ║
+// ║  and Response (EDR) systems. Tracks sessions across requests to detect  ║
+// ║  logical bypasses, lateral movement, and identity theft.                ║
+// ║                                                                         ║
+// ║  Core Capabilities:                                                     ║
+// ║  ├─ Request Lineage: Validates logical navigation flow graphs.           ║
+// ║  ├─ BOLA/IDOR Detection: Tracks resource ID access patterns.             ║
+// ║  ├─ Context Drift: Monitors IP/TLS identity shifts mid-session.          ║
+// ║  └─ Velocity Control: Detects "Impossible Human" interaction speeds.     ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
 | **API Abuse** | GraphQL complexity analysis, REST enumeration, batch attack detection |
 | **DDoS Protection** | L7 flood detection - Slowloris, oversized headers, connection floods |
 

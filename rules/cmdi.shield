@@ -1,6 +1,6 @@
 rule cmdi_attempt : cmdi {
     meta:
-        author      = "laraxaar"
+        author      = "shieldwall-core"
         description = "OS command injection — shell metacharacter + command name"
         severity    = "critical"
 

@@ -1,0 +1,232 @@
+{
+  "period": "monthly",
+  "generatedAt": "2026-04-25T22:13:34.293Z",
+  "periodDays": 30,
+  "summary": {
+    "totalAttacks": 0,
+    "uniqueAttackers": 0,
+    "blocked": 0,
+    "detected": 0,
+    "blockRate": 0,
+    "bySeverity": {
+      "critical": 0,
+      "high": 0,
+      "medium": 0,
+      "low": 0
+    },
+    "byCategory": {},
+    "byResponse": {}
+  },
+  "topThreats": {
+    "topRules": [],
+    "topAttackers": [],
+    "topTargets": []
+  },
+  "endpoints": {
+    "all": [],
+    "critical": [],
+    "highVolume": []
+  },
+  "timeline": [
+    {
+      "date": "2026-03-27",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-03-28",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-03-29",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-03-30",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-03-31",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-01",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-02",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-03",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-04",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-05",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-06",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-07",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-08",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-09",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-10",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-11",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-12",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-13",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-14",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-15",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-16",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-17",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-18",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-19",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-20",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-21",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-22",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-23",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-24",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    },
+    {
+      "date": "2026-04-25",
+      "attacks": 0,
+      "blocked": 0,
+      "uniqueIPs": 0
+    }
+  ],
+  "recommendations": [],
+  "comparison": null,
+  "extended": {
+    "attackEvolution": {
+      "firstHalf": 0,
+      "secondHalf": 0,
+      "trend": "accelerating"
+    },
+    "newAttackPatterns": [],
+    "geographicDistribution": [],
+    "vectorShift": null,
+    "persistentAttackers": [],
+    "roi": {
+      "blockedRequests": 0,
+      "trafficSavedGB": "0.00",
+      "cpuTimeSavedHours": "0.00",
+      "estimatedCostSaved": "$0.00"
+    },
+    "chartSVG": "<svg width=\"600\" height=\"200\" xmlns=\"http://www.w3.org/2000/svg\">\n      <text x=\"20\" y=\"15\" font-size=\"12\" fill=\"#666\">Attacks</text>\n      <line x1=\"35\" y1=\"20\" x2=\"35\" y2=\"180\" stroke=\"#ddd\"/>\n      <line x1=\"35\" y1=\"180\" x2=\"580\" y2=\"180\" stroke=\"#ddd\"/>\n      <rect x=\"40\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"58\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"76\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"94\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"112\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"130\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"148\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"166\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"184\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"202\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"220\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"238\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"256\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"274\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"292\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"310\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"328\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"346\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"364\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"382\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"400\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"418\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"436\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"454\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"472\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"490\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"508\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"526\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"544\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/><rect x=\"562\" y=\"180\" width=\"16\" height=\"0\" fill=\"#22c55e\" rx=\"2\"/>\n      <text x=\"300\" y=\"195\" font-size=\"10\" fill=\"#999\" text-anchor=\"middle\">Timeline</text>\n    </svg>"
+  }
+}

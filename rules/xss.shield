@@ -1,6 +1,6 @@
 rule xss_attempt : xss {
     meta:
-        author      = "laraxaar"
+        author      = "shieldwall-core"
         description = "Structural patterns required for script execution in HTML context"
         severity    = "critical"
 

@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ShieldWall | Elite Security Operations</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400;700&display=swap');
+    
+    :root {
+      --bg-base: #05050A;
+      --panel-bg: rgba(20, 20, 30, 0.6);
+      --glass-border: rgba(255, 255, 255, 0.08);
+      --accent: #8b5cf6;
+      --accent-glow: rgba(139, 92, 246, 0.4);
+      --success: #10b981;
+      --danger: #ef4444;
+      --warning: #f59e0b;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+    }
+
+    body {
+      background: var(--bg-base);
+      background-image: radial-gradient(circle at 50% 0%, var(--accent-glow), transparent 40%);
+      color: var(--text-main);
+      font-family: 'Inter', sans-serif;
+      margin: 0;
+      padding: 30px;
+      min-height: 100vh;
+      box-sizing: border-box;
+      overflow-x: hidden;
+    }
+
+    .header {
+      text-align: center;
+      margin-bottom: 40px;
+      position: relative;
+    }
+
+    .header h1 {
+      font-size: 2.5rem;
+      font-weight: 800;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      background: linear-gradient(135deg, #fff, var(--accent));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin: 0;
+    }
+
+    .pulse {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      background: var(--success);
+      border-radius: 50%;
+      box-shadow: 0 0 10px var(--success);
+      animation: pulse 2s infinite;
+      margin-right: 10px;
+    }
+
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+      70% { box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 400px 1fr 400px;
+      gap: 24px;
+      max-width: 1800px;
+      margin: 0 auto;
+    }
+
+    .panel {
+      background: var(--panel-bg);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--glass-border);
+      border-radius: 16px;
+      padding: 24px;
+      box-shadow: 0 20px 40px rgba(0,0,0,0.4);
+      display: flex;
+      flex-direction: column;
+    }
+
+    .panel-header {
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.15em;
+      color: var(--accent);
+      font-weight: 800;
+      margin-bottom: 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .stat-box {
+      background: rgba(0,0,0,0.3);
+      border: 1px solid var(--glass-border);
+      border-radius: 12px;
+      padding: 16px;
+      text-align: center;
+      margin-bottom: 15px;
+    }
+
+    .stat-val { font-size: 2rem; font-weight: 800; color: #fff; font-family: 'JetBrains Mono', monospace; }
+    .stat-label { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; margin-top: 5px; }
+
+    input, textarea, select {
+      width: 100%;
+      background: rgba(0,0,0,0.5);
+      border: 1px solid var(--glass-border);
+      border-radius: 8px;
+      color: #fff;
+      padding: 12px;
+      font-family: 'JetBrains Mono', monospace;
+      outline: none;
+      font-size: 0.85rem;
+      box-sizing: border-box;
+      margin-bottom: 16px;
+      transition: border-color 0.3s;
+    }
+    input:focus, textarea:focus { border-color: var(--accent); }
+
+    .btn {
+      background: linear-gradient(135deg, var(--accent), #6d28d9);
+      color: white;
+      border: none;
+      padding: 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      transition: all 0.3s;
+      width: 100%;
+      position: relative;
+      overflow: hidden;
+    }
+    .btn:hover { transform: translateY(-2px); box-shadow: 0 10px 20px var(--accent-glow); }
+
+    .feed {
+      flex: 1;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding-right: 10px;
+    }
+    
+    .feed::-webkit-scrollbar { width: 6px; }
+    .feed::-webkit-scrollbar-thumb { background: var(--glass-border); border-radius: 3px; }
+
+    .feed-item {
+      background: rgba(0,0,0,0.4);
+      border-left: 3px solid var(--success);
+      padding: 16px;
+      border-radius: 0 8px 8px 0;
+      animation: slideIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .feed-item.blocked { border-left-color: var(--danger); background: rgba(239, 68, 68, 0.05); }
+    .feed-item.warning { border-left-color: var(--warning); }
+
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateX(20px); }
+      to { opacity: 1; transform: translateX(0); }
+    }
+
+    .feed-meta { display: flex; justify-content: space-between; font-size: 0.75rem; color: var(--text-muted); margin-bottom: 8px; }
+    .feed-target { font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; word-break: break-all; }
+    .feed-rules { margin-top: 10px; font-size: 0.75rem; color: var(--danger); }
+
+    .trace-block {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.75rem;
+      background: #000;
+      padding: 15px;
+      border-radius: 8px;
+      border: 1px solid var(--glass-border);
+      color: #a5b4fc;
+      overflow-x: auto;
+      white-space: pre-wrap;
+    }
+
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <h1><span class="pulse"></span>ShieldWall Security Center</h1>
+    <p style="color: var(--text-muted); margin-top: 5px;">Advanced Web Application Firewall (Zero-Day Protected)</p>
+  </div>
+
+  <div class="grid">
+    <!-- Left: Simulator -->
+    <div class="panel">
+      <div class="panel-header">🎯 Attack Simulator</div>
+      
+      <select id="sim-preset">
+        <option value="custom">Custom Payload</option>
+        <option value="sqli">SQLi Bypass</option>
+        <option value="xss">XSS Payload</option>
+        <option value="lfi">Local File Inclusion (Path Traversal)</option>
+      </select>
+
+      <input type="text" id="sim-url" placeholder="Target URL/Path" value="/api/v1/auth/login">
+      <textarea id="sim-body" style="height: 120px;" placeholder="Request Body (JSON/Form)"></textarea>
+      
+      <button class="btn" id="fire-btn">Fire Payload</button>
+
+      <div style="margin-top: 30px;">
+        <div class="panel-header">⚡ Auto Stresser</div>
+        <button class="btn" id="stress-btn" style="background: linear-gradient(135deg, #ef4444, #b91c1c);">Start Automated Fuzzing</button>
+      </div>
+    </div>
+
+    <!-- Center: Live Threat Feed -->
+    <div class="panel">
+      <div class="panel-header">📡 Live Inspection Feed <span id="conn-status" style="color: var(--success); font-weight: normal;">● Connected</span></div>
+      <div class="feed" id="live-feed">
+        <div style="text-align: center; color: var(--text-muted); margin-top: 50px;">Awaiting traffic...</div>
+      </div>
+    </div>
+
+    <!-- Right: Telemetry & Traces -->
+    <div class="panel">
+      <div class="panel-header">📊 Telemetry</div>
+      <div style="display: flex; gap: 10px;">
+        <div class="stat-box" style="flex:1">
+          <div class="stat-val" id="stat-req">0</div>
+          <div class="stat-label">Requests</div>
+        </div>
+        <div class="stat-box" style="flex:1">
+          <div class="stat-val" id="stat-blk" style="color: var(--danger)">0</div>
+          <div class="stat-label">Blocked</div>
+        </div>
+      </div>
+
+      <div class="panel-header" style="margin-top: 20px;">🔍 Last Deep Trace</div>
+      <div class="trace-block" id="deep-trace">No trace available yet. Fire a payload to view engine execution trace.</div>
+    </div>
+  </div>
+
+  <script>
+    let reqCount = 0;
+    let blkCount = 0;
+
+    // Presets Logic
+    const presets = {
+      custom: { url: '/', body: '' },
+      sqli: { url: '/api/login', body: '{"user": "admin\' OR \'1\'=\'1", "pass": ""}' },
+      xss: { url: '/search?q=<script>alert("XSS")</script>', body: '' },
+      lfi: { url: '/download?file=../../../../etc/passwd', body: '' }
+    };
+
+    document.getElementById('sim-preset').addEventListener('change', (e) => {
+      const p = presets[e.target.value];
+      document.getElementById('sim-url').value = p.url;
+      document.getElementById('sim-body').value = p.body;
+    });
+
+    // Fire Simulator Payload
+    document.getElementById('fire-btn').addEventListener('click', async () => {
+      const url = document.getElementById('sim-url').value;
+      const body = document.getElementById('sim-body').value;
+      const method = body.trim() ? 'POST' : 'GET';
+      
+      try {
+        await fetch('/api/test', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ method, url, body })
+        });
+      } catch (e) {
+        console.error('Simulation failed', e);
+      }
+    });
+
+    // Start Stresser (Trigger external script via API)
+    document.getElementById('stress-btn').addEventListener('click', async () => {
+      // We will simulate the stresser by firing rapid requests from the client for visual effect
+      const payloads = Object.values(presets).slice(1);
+      for(let i=0; i<20; i++) {
+        const p = payloads[Math.floor(Math.random() * payloads.length)];
+        fetch('/api/test', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ method: p.body?'POST':'GET', url: p.url, body: p.body })
+        });
+        await new Promise(r => setTimeout(r, 150));
+      }
+    });
+
+    // SSE Connection
+    const feed = document.getElementById('live-feed');
+    const evtSource = new EventSource('/api/live-logs');
+    
+    evtSource.onmessage = function(event) {
+      const data = JSON.parse(event.data);
+      if(reqCount === 0) feed.innerHTML = ''; // clear waiting msg
+      
+      reqCount++;
+      if (data.blocked) blkCount++;
+      
+      document.getElementById('stat-req').innerText = reqCount;
+      document.getElementById('stat-blk').innerText = blkCount;
+
+      const method = data.request?.method || 'GET';
+      const url = data.request?.url || '/';
+      const score = data.riskScore || 0;
+
+      const item = document.createElement('div');
+      item.className = `feed-item ${data.blocked ? 'blocked' : 'success'}`;
+      
+      let rulesHtml = '';
+      if (data.matches && data.matches.length > 0) {
+        rulesHtml = `<div class="feed-rules">${data.matches.map(m => `[${m.severity.toUpperCase()}] ${m.rule}`).join('<br>')}</div>`;
+      }
+
+      item.innerHTML = `
+        <div class="feed-meta">
+          <span>${new Date().toLocaleTimeString()}</span>
+          <span style="color: ${data.blocked ? 'var(--danger)' : 'var(--success)'}">Risk: ${score.toFixed(1)}</span>
+        </div>
+        <div class="feed-target">${method} ${url}</div>
+        ${rulesHtml}
+      `;
+
+      feed.prepend(item);
+      if (feed.children.length > 50) feed.removeChild(feed.lastChild);
+
+      // Update deep trace
+      if (data.trace) {
+        let traceText = `[REQ] ${method} ${url}\n`;
+        data.trace.forEach(t => {
+          traceText += `[${String(t.ms).padStart(6, ' ')}ms] ‣ ${t.step}\n`;
+        });
+        document.getElementById('deep-trace').innerText = traceText;
+      }
+    };
+
+    evtSource.onerror = function() {
+      document.getElementById('conn-status').innerText = '● Disconnected';
+      document.getElementById('conn-status').style.color = 'var(--danger)';
+    };
+
+  </script>
+</body>
+</html>
+

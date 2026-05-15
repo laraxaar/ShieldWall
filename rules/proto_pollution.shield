@@ -1,6 +1,6 @@
 rule prototype_pollution_nodejs : injection {
     meta:
-        author      = "laraxaar"
+        author      = "shieldwall-core"
         description = "Prototype pollution attempt in Node.js - __proto__, constructor, prototype injection"
         severity    = "critical"
 
@@ -22,7 +22,7 @@ rule prototype_pollution_nodejs : injection {
 
 rule prototype_chain_manipulation : injection {
     meta:
-        author      = "laraxaar"
+        author      = "shieldwall-core"
         description = "Attempt to manipulate object prototype chain"
         severity    = "critical"
 

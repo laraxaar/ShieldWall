@@ -57,14 +57,19 @@ function shieldwall(options = {}) {
     } catch (err) { engine.logger.warn(`Dashboard: ${err.message}`); }
   }
 
-  const middleware = function shieldwallMiddleware(req, res, next) {
+    const middleware = async function shieldwallMiddleware(req, res, next) {
     if (headerSecurity) headerSecurity(req, res);
 
     if (bruteForce) {
       const bf = bruteForce.check(req);
       if (bf.blocked) {
         engine.logger.attack({ blocked: true, rule: 'brute_force', severity: 'high', category: 'brute-force', ip: bf.ip, method: req.method, url: req.url, description: bf.reason });
-        res.status(429).json({ error: 'Too Many Failed Attempts', retryAfter: Math.ceil(bf.retryAfter / 1000) });
+        if (res.status) {
+          res.status(429).json({ error: 'Too Many Failed Attempts', retryAfter: Math.ceil(bf.retryAfter / 1000) });
+        } else {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Too Many Failed Attempts', retryAfter: Math.ceil(bf.retryAfter / 1000) }));
+        }
         return;
       }
     }
@@ -73,19 +78,42 @@ function shieldwall(options = {}) {
       const rl = rateLimiter.check(req);
       if (rl.limited) {
         engine.logger.attack({ blocked: true, rule: 'rate_limit', severity: 'medium', category: 'rate-limit', ip: rl.ip, method: req.method, url: req.url, description: `Rate limit exceeded (${rl.count}/${rl.max})` });
-        res.status(429).json({ error: 'Too Many Requests', retryAfter: Math.ceil(rl.retryAfter / 1000) });
+        if (res.status) {
+          res.status(429).json({ error: 'Too Many Requests', retryAfter: Math.ceil(rl.retryAfter / 1000) });
+        } else {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Too Many Requests', retryAfter: Math.ceil(rl.retryAfter / 1000) }));
+        }
         return;
       }
     }
 
-    const result = engine.analyze(req);
+    const result = await engine.analyze(req, res);
     req.shieldwall = { analyzed: true, blocked: result.blocked, matches: result.matches, severity: result.highestSeverity || 'none' };
 
+    // Handle Active Mitigation
+    if (result.mitigation && !result.blocked) {
+      if (result.mitigation.type === 'challenge') {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(result.mitigation.html);
+        return;
+      }
+      if (result.mitigation.type === 'redirect') {
+        res.writeHead(302, { 'Location': result.mitigation.url });
+        res.end();
+        return;
+      }
+    }
+
     if (result.blocked && result.matches.length) {
-      res.status(engine.options.blockStatusCode);
-      res.setHeader('Content-Type', 'application/json');
-      res.setHeader('X-ShieldWall', 'blocked');
-      res.end(engine.getBlockResponse(result.matches, result.highestSeverity));
+      const code = engine.options.blockStatusCode || 403;
+      const response = engine.getBlockResponse(result.matches, result.highestSeverity);
+      if (res.status) {
+        res.status(code).setHeader('X-ShieldWall', 'blocked').send(response);
+      } else {
+        res.writeHead(code, { 'Content-Type': 'application/json', 'X-ShieldWall': 'blocked' });
+        res.end(response);
+      }
       return;
     }
 

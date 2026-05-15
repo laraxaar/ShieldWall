@@ -71,86 +71,129 @@
       </div>
     </section>
 
-    <!-- Main Content -->
-    <div class="main-grid">
-      <!-- Live Feed -->
-      <section class="panel panel--feed">
-        <div class="panel__header">
-          <h2>🔴 Live Attack Feed</h2>
-          <button class="btn btn--sm" id="clear-feed">Clear</button>
+    <!-- Navigation Tabs -->
+    <nav class="nav-tabs">
+      <button class="nav-btn active" data-tab="overview">📊 Overview</button>
+      <button class="nav-btn" data-tab="rules">📋 Rule Editor</button>
+      <button class="nav-btn" data-tab="map">🌍 Attack Map</button>
+    </nav>
+
+    <!-- Main Content Tabs -->
+    <div class="tab-container">
+      <!-- Tab: Overview -->
+      <div class="tab-content active" id="tab-overview">
+        <div class="main-grid">
+          <!-- Live Feed -->
+          <section class="panel panel--feed">
+            <div class="panel__header">
+              <h2>🔴 Live Attack Feed</h2>
+              <button class="btn btn--sm" id="clear-feed">Clear</button>
+            </div>
+            <div class="feed-list" id="feed-list">
+              <div class="feed-empty">Waiting for events...</div>
+            </div>
+          </section>
+
+          <!-- Right Sidebar -->
+          <aside class="sidebar">
+            <!-- Severity Breakdown -->
+            <section class="panel panel--severity">
+              <div class="panel__header">
+                <h2>Severity Breakdown</h2>
+              </div>
+              <div class="severity-bars">
+                <div class="severity-bar">
+                  <div class="severity-bar__label">
+                    <span class="severity-dot severity-dot--critical"></span>Critical
+                  </div>
+                  <div class="severity-bar__track">
+                    <div class="severity-bar__fill severity-bar__fill--critical" id="sev-critical" style="width:0%"></div>
+                  </div>
+                  <span class="severity-bar__count" id="sev-critical-count">0</span>
+                </div>
+                <div class="severity-bar">
+                  <div class="severity-bar__label">
+                    <span class="severity-dot severity-dot--high"></span>High
+                  </div>
+                  <div class="severity-bar__track">
+                    <div class="severity-bar__fill severity-bar__fill--high" id="sev-high" style="width:0%"></div>
+                  </div>
+                  <span class="severity-bar__count" id="sev-high-count">0</span>
+                </div>
+                <div class="severity-bar">
+                  <div class="severity-bar__label">
+                    <span class="severity-dot severity-dot--medium"></span>Medium
+                  </div>
+                  <div class="severity-bar__track">
+                    <div class="severity-bar__fill severity-bar__fill--medium" id="sev-medium" style="width:0%"></div>
+                  </div>
+                  <span class="severity-bar__count" id="sev-medium-count">0</span>
+                </div>
+                <div class="severity-bar">
+                  <div class="severity-bar__label">
+                    <span class="severity-dot severity-dot--low"></span>Low
+                  </div>
+                  <div class="severity-bar__track">
+                    <div class="severity-bar__fill severity-bar__fill--low" id="sev-low" style="width:0%"></div>
+                  </div>
+                  <span class="severity-bar__count" id="sev-low-count">0</span>
+                </div>
+              </div>
+            </section>
+
+            <!-- Top Attack Types -->
+            <section class="panel panel--categories">
+              <div class="panel__header">
+                <h2>Top Attack Types</h2>
+              </div>
+              <div class="category-list" id="category-list">
+                <div class="feed-empty">No data yet</div>
+              </div>
+            </section>
+
+            <!-- Top IPs -->
+            <section class="panel panel--ips">
+              <div class="panel__header">
+                <h2>Top Attacker IPs</h2>
+              </div>
+              <div class="ip-list" id="ip-list">
+                <div class="feed-empty">No data yet</div>
+              </div>
+            </section>
+          </aside>
         </div>
-        <div class="feed-list" id="feed-list">
-          <div class="feed-empty">Waiting for events...</div>
+      </div>
+
+      <!-- Tab: Rules -->
+      <div class="tab-content" id="tab-rules">
+        <div class="editor-layout">
+          <aside class="editor-sidebar">
+            <div class="panel__header"><h2>Rule Files</h2></div>
+            <div class="file-list" id="rule-file-list"></div>
+          </aside>
+          <main class="editor-main">
+            <div class="editor-header">
+              <span id="current-filename">Select a file...</span>
+              <button class="btn btn--sm" id="save-rule" disabled>Save & Reload</button>
+            </div>
+            <textarea id="rule-editor" spellcheck="false" placeholder="Select a rule file to edit..."></textarea>
+          </main>
         </div>
-      </section>
+      </div>
 
-      <!-- Right Sidebar -->
-      <aside class="sidebar">
-        <!-- Severity Breakdown -->
-        <section class="panel panel--severity">
+      <!-- Tab: Map -->
+      <div class="tab-content" id="tab-map">
+        <div class="map-container">
           <div class="panel__header">
-            <h2>Severity Breakdown</h2>
+            <h2>🌍 Live Global Threats</h2>
+            <div id="map-stats" class="header__uptime">0 Active Nodes</div>
           </div>
-          <div class="severity-bars">
-            <div class="severity-bar">
-              <div class="severity-bar__label">
-                <span class="severity-dot severity-dot--critical"></span>Critical
-              </div>
-              <div class="severity-bar__track">
-                <div class="severity-bar__fill severity-bar__fill--critical" id="sev-critical" style="width:0%"></div>
-              </div>
-              <span class="severity-bar__count" id="sev-critical-count">0</span>
-            </div>
-            <div class="severity-bar">
-              <div class="severity-bar__label">
-                <span class="severity-dot severity-dot--high"></span>High
-              </div>
-              <div class="severity-bar__track">
-                <div class="severity-bar__fill severity-bar__fill--high" id="sev-high" style="width:0%"></div>
-              </div>
-              <span class="severity-bar__count" id="sev-high-count">0</span>
-            </div>
-            <div class="severity-bar">
-              <div class="severity-bar__label">
-                <span class="severity-dot severity-dot--medium"></span>Medium
-              </div>
-              <div class="severity-bar__track">
-                <div class="severity-bar__fill severity-bar__fill--medium" id="sev-medium" style="width:0%"></div>
-              </div>
-              <span class="severity-bar__count" id="sev-medium-count">0</span>
-            </div>
-            <div class="severity-bar">
-              <div class="severity-bar__label">
-                <span class="severity-dot severity-dot--low"></span>Low
-              </div>
-              <div class="severity-bar__track">
-                <div class="severity-bar__fill severity-bar__fill--low" id="sev-low" style="width:0%"></div>
-              </div>
-              <span class="severity-bar__count" id="sev-low-count">0</span>
-            </div>
+          <div id="world-map">
+             <!-- SVG Map will be injected here -->
+             <div class="feed-empty">Initializing Global Visualizer...</div>
           </div>
-        </section>
-
-        <!-- Top Attack Types -->
-        <section class="panel panel--categories">
-          <div class="panel__header">
-            <h2>Top Attack Types</h2>
-          </div>
-          <div class="category-list" id="category-list">
-            <div class="feed-empty">No data yet</div>
-          </div>
-        </section>
-
-        <!-- Top IPs -->
-        <section class="panel panel--ips">
-          <div class="panel__header">
-            <h2>Top Attacker IPs</h2>
-          </div>
-          <div class="ip-list" id="ip-list">
-            <div class="feed-empty">No data yet</div>
-          </div>
-        </section>
-      </aside>
+        </div>
+      </div>
     </div>
   </div>
 

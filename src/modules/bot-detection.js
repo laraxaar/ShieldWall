@@ -169,9 +169,33 @@ function check(decodedReq) {
   const isBrowser = /Chrome|Firefox|Safari|Edge/i.test(ua);
 
   // Propagate Honeypot execution faults across the session boundary
-  if (decodedReq.honeypotTriggered) {
-    const data = SESSION_DATA.get(sessionId);
-    if (data) data.isBot = true;
+  const data = SESSION_DATA.get(sessionId);
+  if (decodedReq.honeypotTriggered && data) {
+    data.isBot = true;
+  }
+
+  // 1. TLS/UA Mismatch (Killer for Selenium/Puppeteer)
+  const ja4 = headers['x-ja4-fingerprint'];
+  const tlsEntropy = parseFloat(headers['x-tls-random-entropy'] || '0');
+  const isChromeUA = /Chrome/i.test(ua);
+
+  if (isChromeUA && ja4) {
+    if (tlsEntropy < 6.0) { // Chrome has ~7.5, scripts often < 5.5
+      indicators.push('tls_ua_mismatch_low_entropy');
+    }
+  }
+
+  // 2. HTML-to-Asset Ratio (Phantom Traffic / Scraper Detection)
+  if (data && data.requests.length > 10) {
+    const htmlRequests = data.requests.filter(r => 
+      !r.path.match(/\.(js|css|png|jpg|svg|woff2|ico)$/i)
+    ).length;
+    
+    const ratio = htmlRequests / data.requests.length;
+    // Scrapers fetch API/HTML but drop statics. Legitimate users fetch all.
+    if (ratio > 0.95 && data.requests.length > 15) {
+      indicators.push('no_static_assets_fetched');
+    }
   }
 
   const behaviorIndicators = analyzeBehavior(sessionId, {

@@ -43,7 +43,7 @@ rule traversal_encoding_evasion : evasion {
         $double_encoded_slash = /%25(25)*2f/i
         $overlong_utf8       = /%c0%ae|%c1%9c|%c0%af|%e0%80%ae/i
         $unicode_dot         = /%u002e|%u2215|%u2216/i
-        $excessive_slash     = /\/{3,}|\\\//{2,}|\\{3,}/
+        $excessive_slash     = /[\/\\]{3,}/
 
     condition:
         $double_encode in $raw_url or $overlong_utf8 in $raw_url

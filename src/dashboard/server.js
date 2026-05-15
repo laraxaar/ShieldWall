@@ -33,7 +33,7 @@ class Dashboard {
 
   _http(req, res) {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    if (url.pathname.startsWith('/api/')) return this._api(url.pathname, res);
+    if (url.pathname.startsWith('/api/')) return this._api(req, res);
 
     let file = url.pathname === '/' ? '/index.html' : url.pathname;
     file = path.join(this.publicDir, file);
@@ -48,16 +48,55 @@ class Dashboard {
     });
   }
 
-  _api(pathname, res) {
+  _api(req, res) {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const pathname = url.pathname;
+
     res.setHeader('Content-Type', 'application/json');
     res.setHeader('Access-Control-Allow-Origin', '*');
     const json = (d) => { res.writeHead(200); res.end(JSON.stringify(d)); };
+    const err = (m, code = 400) => { res.writeHead(code); res.end(JSON.stringify({ error: m })); };
+
+    if (req.method === 'POST') {
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', () => {
+        try {
+          const data = JSON.parse(body);
+          if (pathname === '/api/rules/save') {
+            if (!data.filename || !data.content) return err('Missing filename or content');
+            const safeFile = path.basename(data.filename);
+            const fullPath = path.join(this.engine.options.rulesDir, safeFile);
+            fs.writeFileSync(fullPath, data.content, 'utf8');
+            this.engine.reloadRules();
+            return json({ success: true });
+          }
+          err('Not found');
+        } catch (e) { err('Invalid JSON'); }
+      });
+      return;
+    }
 
     switch (pathname) {
       case '/api/stats': return json(this.engine?.getStats() || {});
       case '/api/history': return json(this.engine?.logger.getHistory(200) || []);
       case '/api/rules': return json((this.engine?.rules || []).map(r => ({ name: r.name, tags: r.tags, severity: r.meta?.severity, description: r.meta?.description, source: r.sourceFile })));
-      default: res.writeHead(404); res.end('{"error":"Not found"}');
+      case '/api/rules/content': {
+        const file = url.searchParams.get('file');
+        if (!file) return err('Missing file param');
+        const safeFile = path.basename(file);
+        const fullPath = path.join(this.engine.options.rulesDir, safeFile);
+        try {
+          const content = fs.readFileSync(fullPath, 'utf8');
+          return json({ content });
+        } catch (e) { return err('File not found', 404); }
+      }
+      case '/api/geo-data': {
+        const attacks = this.engine?.logger.getHistory(500).filter(e => e.type === 'attack') || [];
+        const geoPoints = attacks.map(a => ({ ip: a.ip, geo: a.geo, severity: a.severity, timestamp: a.timestamp }));
+        return json(geoPoints);
+      }
+      default: err('Not found', 404);
     }
   }
 

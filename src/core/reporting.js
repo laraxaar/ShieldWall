@@ -5,7 +5,8 @@ const path = require('path');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const REPORT_14DAYS = 14 * DAY_MS;
-const REPORT_MONTHLY = 30 * DAY_MS;
+// Cap interval at 24 days to avoid Node.js 32-bit setTimeout/setInterval overflow (2147483647ms)
+const REPORT_MONTHLY = Math.min(30 * DAY_MS, 2147483647); 
 
 class ReportingEngine {
   constructor(options = {}) {

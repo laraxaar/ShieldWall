@@ -1,16 +1,6 @@
-node_modules/
-coverage/
-.env
-*.log
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/
-dist/
-
-*.bak
-*.tmp
-
-# Excluded tests and demos
-anomaly.test.js
-smart-anomaly-demo.js
+node_modules/  
+.env  
+*.log  
+bin/  
+.git_commit_msg.txt  
+commit.txt 
