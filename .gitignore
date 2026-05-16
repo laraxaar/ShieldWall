@@ -21,3 +21,5 @@ gateway/shieldwall-gateway
 gateway/shieldwall-gateway.exe
 
 anomaly.test.js
+
+.claudeignore

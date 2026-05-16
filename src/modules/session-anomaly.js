@@ -119,44 +119,46 @@ function checkGeoVelocity(sessionId, geoData, decodedReq) {
   const country = geoData.country?.toUpperCase();
   const prevCountry = data.lastLocation.country?.toUpperCase();
 
-  const currCoords = {
-    lat: geoData.city?.latitude || CITY_COORDS[country]?.lat || CITY_COORDS['US'].lat,
-    lon: geoData.city?.longitude || CITY_COORDS[country]?.lon || CITY_COORDS['US'].lon
-  };
+  const currCoords = geoData.city?.latitude 
+    ? { lat: geoData.city.latitude, lon: geoData.city.longitude }
+    : null;
 
-  const prevCoords = {
-    lat: data.lastLocation.lat || CITY_COORDS[prevCountry]?.lat || CITY_COORDS['US'].lat,
-    lon: data.lastLocation.lon || CITY_COORDS[prevCountry]?.lon || CITY_COORDS['US'].lon
-  };
-
-  const velocity = calculateGeoVelocity(
-    { ...prevCoords, timestamp: data.lastLocation.timestamp },
-    { ...currCoords, timestamp: now },
-    timeDiff
-  );
+  const prevCoords = data.lastLocation.lat 
+    ? { lat: data.lastLocation.lat, lon: data.lastLocation.lon }
+    : null;
 
   const indicators = [];
   const vpnContext = isSuspectedVPN(decodedReq);
 
-  // DEEP DIVE: FP Circuit Breaker for VPNs.
-  // Standard travel maxes out at ~900km/h (commercial jet).
-  // However, turning on a VPN triggers millions of km/h. 
-  // If we suspect a VPN, we downgrade the threat severity of impossible travel.
-  if (velocity > 900) {
-    if (vpnContext) {
-      indicators.push({ type: 'vpn_node_switch', detail: `VPN routing altered` }); // Low weight mapping expected
-    } else {
-      indicators.push({
-        type: 'impossible_travel',
-        detail: `Velocity ${velocity.toFixed(0)} km/h from ${prevCountry} to ${country}`,
-      });
+  // Считаем скорость ТОЛЬКО если у нас есть точные координаты городов
+  if (currCoords && prevCoords && timeDiff > 0) {
+    const velocity = calculateGeoVelocity(
+      { ...prevCoords, timestamp: data.lastLocation.timestamp },
+      { ...currCoords, timestamp: now },
+      timeDiff
+    );
+
+    if (velocity > 900) {
+      if (vpnContext) {
+        indicators.push({ type: 'vpn_node_switch', detail: `VPN routing altered` }); // Low weight mapping expected
+      } else {
+        indicators.push({
+          type: 'impossible_travel',
+          detail: `Velocity ${velocity.toFixed(0)} km/h from ${prevCountry} to ${country}`,
+        });
+      }
+    }
+  } else if (!currCoords || !prevCoords) {
+    // Если городов нет, используем консервативный таймаут для смены страны (1 час)
+    if (country !== prevCountry && timeDiff < 3600000 && !vpnContext) {
+      indicators.push({ type: 'rapid_country_switch_no_city', detail: `Country changed from ${prevCountry} to ${country} without city data in <1h` });
     }
   }
-  
+
   const isMobile = isMobileUA(data.userAgent);
   const rapidThreshold = isMobile || vpnContext ? 300000 : 3600000;
   
-  if (country !== prevCountry && timeDiff < rapidThreshold) {
+  if (currCoords && prevCoords && country !== prevCountry && timeDiff < rapidThreshold) {
     indicators.push({
       type: 'rapid_country_switch',
       detail: `Geo bounce: ${prevCountry} to ${country} in ${(timeDiff/60000).toFixed(1)} min`,
@@ -212,6 +214,8 @@ function checkFingerprintChange(sessionId, fingerprint) {
  * @param {Object} decodedReq - Standardized extraction object from Decoder.
  * @returns {Array} Risk match instances for engine evaluation.
  */
+const IP_SESSION_MAP = new Map();
+
 function check(decodedReq) {
   const sessionId = decodedReq.sessionId || `${decodedReq.ip}:${decodedReq.userAgent}`;
   if (!sessionId) return [];
@@ -223,9 +227,57 @@ function check(decodedReq) {
     userAgent: decodedReq.userAgent,
     lastLocation: null,
     fingerprint: null,
+    errorCount: 0,
+    lastErrorReset: now,
   };
 
   const indicators = [];
+
+  const clientIp = decodedReq.ip;
+  if (!IP_SESSION_MAP.has(clientIp)) IP_SESSION_MAP.set(clientIp, new Set());
+  const ipSessions = IP_SESSION_MAP.get(clientIp);
+  ipSessions.add(sessionId);
+
+  // Ограничиваем размер Set, чтобы не забить память
+  if (ipSessions.size > 100) {
+    const oldestSession = ipSessions.values().next().value;
+    ipSessions.delete(oldestSession);
+  }
+
+  // Если с одного IP идет больше 10 уникальных сессий за короткое время
+  if (ipSessions.size > 10) {
+    indicators.push({
+      type: 'credential_stuffing_farm',
+      detail: `IP ${clientIp} associated with ${ipSessions.size} unique sessions (possible botnet/stuffing)`
+    });
+  }
+
+  const statusCode = decodedReq.statusCode || decodedReq._internalStatusCode; // Fallback from engine
+  if (statusCode && (statusCode >= 400 || statusCode === 500)) {
+    data.errorCount = (data.errorCount || 0) + 1;
+    if (data.errorCount > 20) {
+      indicators.push({
+        type: 'fuzzing_error_spike',
+        detail: `${data.errorCount} error responses in session (possible blind fuzzing)`
+      });
+    }
+  }
+  if (!data.lastErrorReset) data.lastErrorReset = now;
+  // Сброс счетчика раз в 10 минут
+  if (now - data.lastErrorReset > 600000) {
+    data.errorCount = 0;
+    data.lastErrorReset = now;
+  }
+
+  const referer = decodedReq.headers && (decodedReq.headers['referer'] || decodedReq.headers['origin']);
+  const sensitivePaths = ['/api/payment', '/api/admin', '/api/password', '/login'];
+  if (sensitivePaths.some(p => (decodedReq.path || '').includes(p))) {
+    if (!referer) {
+      indicators.push({ type: 'sensitive_no_referer', detail: 'Direct request to sensitive endpoint without Referer/Origin' });
+    } else if (decodedReq.headers && decodedReq.headers['host'] && !referer.includes(decodedReq.headers['host'])) {
+      indicators.push({ type: 'cross_origin_sensitive', detail: `Cross-origin request to sensitive endpoint from ${referer.substring(0, 30)}` });
+    }
+  }
 
   // --- 1. Request Lineage (Process Tree Analogue) ---
   if (!SESSION_GRAPHS.has(sessionId)) SESSION_GRAPHS.set(sessionId, []);

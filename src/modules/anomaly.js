@@ -18,6 +18,8 @@
  * - Ops Budget: Limits regex execution depth to prevent ReDoS on massive inputs.
  */
 
+const crypto = require('crypto');
+
 const SCORE_THRESHOLD = 15;
 const CRITICAL_THRESHOLD = SCORE_THRESHOLD * 2; // Dynamic based on SCORE_THRESHOLD
 
@@ -412,9 +414,23 @@ function calculateCodeRatio(str) {
   return operators / operands; 
 }
 
+function detectHomoglyphs(str) {
+  if (!str) return 0;
+  // Ищем смешение латиницы и кириллицы в одном слове
+  const matches = str.match(/[a-zа-яё]+/gi);
+  if (!matches) return 0;
+  let mixedCount = 0;
+  for (const word of matches) {
+    const hasLatin = /[a-z]/i.test(word);
+    const hasCyrillic = /[а-яё]/i.test(word);
+    if (hasLatin && hasCyrillic) mixedCount++;
+  }
+  return mixedCount;
+}
+
 function calculateNgramDeviation(str) {
   if (!str || str.length < 20) return 0;
-  const lower = str.toLowerCase().replace(/[^a-z]/g, ''); 
+  const lower = str.normalize('NFKC').toLowerCase().replace(/[^a-z]/g, ''); 
   if (lower.length < 20) return 0;
   let total = 0, valid = 0;
   for (let i = 0; i < lower.length - 1; i++) {
@@ -529,6 +545,16 @@ function detectGraphQLAbuse(decodedReq) {
   return score;
 }
 
+function detectHeaderCRLFInjection(decodedReq) {
+  const headers = decodedReq.headers || {};
+  for (const [key, val] of Object.entries(headers)) {
+    if (typeof val === 'string' && /[\r\n]/.test(val)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function getRequestShape(decodedReq) {
   const method = decodedReq.method || 'GET';
   const path = decodedReq.path || '/';
@@ -554,7 +580,7 @@ function getRequestShape(decodedReq) {
      extractKeys(bodyObj, 'b:');
   }
   
-  return require('crypto').createHash('sha256').update(shape).digest('hex').substring(0, 12);
+  return crypto.createHash('sha256').update(shape).digest('hex').substring(0, 12);
 }
 
 const STATS_MAP = new Map();
@@ -606,10 +632,49 @@ const _cleanupInterval = setInterval(() => {
 }, 60000);
 if (_cleanupInterval.unref) _cleanupInterval.unref();
 
+const _tempMapsCleanup = setInterval(() => {
+  const now = Date.now();
+  for (const [key, timestamps] of CONCURRENCY_MAP.entries()) {
+    if (timestamps.length === 0 || now - timestamps[timestamps.length - 1] > 5000) {
+      CONCURRENCY_MAP.delete(key);
+    }
+  }
+  for (const [key, history] of RESOURCE_HISTOGRAM.entries()) {
+    const recent = history.filter(h => now - h.ts < 3600000);
+    if (recent.length === 0) {
+      RESOURCE_HISTOGRAM.delete(key);
+    } else {
+      RESOURCE_HISTOGRAM.set(key, recent);
+    }
+  }
+  for (const [key, data] of MUTATION_CACHE.entries()) {
+    if (now - data.ts > 300000) {
+      MUTATION_CACHE.delete(key);
+    }
+  }
+}, 60000);
+if (_tempMapsCleanup.unref) _tempMapsCleanup.unref();
+
+function detectObfuscatedJNDI(str) {
+  if (!str) return false;
+  const capped = str.slice(0, MAX_REGEX_INPUT);
+  const jndiPattern = /\$\{.*?(jndi|lower|upper|env|sys|java|date).*?:.*?\}/is;
+  return jndiPattern.test(capped);
+}
+
 function analyze(decodedReq) {
+  const path = decodedReq.path || '/';
+  const method = (decodedReq.method || '').toUpperCase();
+
+  // FAST PATH: Пропускаем статику и безопасные методы без тяжелых вычислений
+  if (method === 'GET' && !decodedReq.query && /\.(js|css|png|jpg|jpeg|gif|svg|ico|woff2|ttf|mp4)$/i.test(path)) {
+    return { score: 0, level: 'none', threshold: SCORE_THRESHOLD, factors: [], groupScores: { encoding: 0, structural: 0, behavioral: 0 }, description: 'Clean (Static Asset)', _path: path, _maxEntropy: 0, _maxSpecialRatio: 0, _paramEntropyUpdates: new Map(), _paramSpecialUpdates: new Map(), _paramTypeUpdates: new Map(), _shapeHash: null };
+  }
+
   const factors = [];
   let score = 0;
   const groupScores = { encoding: 0, structural: 0, behavioral: 0 };
+  const paramTypeUpdates = new Map();
 
   let opsBudget = 1000;
   const budgetMatch = (str, regex) => {
@@ -653,6 +718,18 @@ function analyze(decodedReq) {
   
   const candidates = [urlCapped, bodyCapped, ...queryVals, ...cookieVals].filter(Boolean);
   const suppressed = detectSafePatterns(candidates);
+
+  const allFields = candidates.join(' ');
+  const contentType = (decodedReq.headers && decodedReq.headers['content-type']) ? decodedReq.headers['content-type'].toLowerCase() : '';
+  if (contentType.includes('application/json') && bodyCapped.trim().startsWith('<')) {
+    add(WEIGHTS.criticalExploit, 'content_type_mismatch', 'JSON Content-Type but XML/HTML payload structure detected');
+  } else if (contentType.includes('application/xml') && bodyCapped.trim().startsWith('{')) {
+    add(WEIGHTS.structural_injection, 'content_type_mismatch', 'XML Content-Type but JSON payload structure detected');
+  }
+
+  if (detectObfuscatedJNDI(allFields)) {
+    add(WEIGHTS.criticalExploit, 'obfuscated_jndi', 'Obfuscated JNDI/Log4Shell pattern detected');
+  }
 
   const encLayers = countEncodingLayers(decodedReq.rawUrl || '');
   if (encLayers >= 2) add(WEIGHTS.encodingLayers * encLayers, 'multi_layer_encoding', `${encLayers} encoding layers detected`);
@@ -775,11 +852,14 @@ function analyze(decodedReq) {
 
     const currentType = getParamType(strVal);
     if (currentType !== 'string') {
-      paramStats.types.set(currentType, (paramStats.types.get(currentType) || 0) + 1);
+      paramTypeUpdates.set(`${key}:${currentType}`, (paramStats.types.get(currentType) || 0) + 1);
     }
     const isUsuallyNumeric = (paramStats.types.get('int') || 0) > 20 || (paramStats.types.get('uuid') || 0) > 20;
-    if (isUsuallyNumeric && currentType === 'string' && charClassRatio(strVal, /[^a-zA-Z0-9\s]/g) > 0.1) {
-      paramAnomalies.push(`Query param "${key}" type mutation (${[...paramStats.types.keys()].join(',')} -> suspicious string)`);
+    if (isUsuallyNumeric && currentType === 'string') {
+      const logicKeywords = /\b(OR|AND|UNION|SELECT|FROM|WHERE|LIKE|BETWEEN|WAITFOR|SLEEP)\b/i;
+      if (logicKeywords.test(strVal) || charClassRatio(strVal, /[^a-zA-Z0-9\s]/g) > 0.05) {
+        paramAnomalies.push(`Query param "${key}" type mutation with logic keywords (${strVal.substring(0, 20)})`);
+      }
     }
 
     if (strVal.length < 10) continue;
@@ -807,11 +887,14 @@ function analyze(decodedReq) {
 
       const currentType = getParamType(strVal);
       if (currentType !== 'string') {
-        paramStats.types.set(currentType, (paramStats.types.get(currentType) || 0) + 1);
+        paramTypeUpdates.set(`body:${key}:${currentType}`, (paramStats.types.get(currentType) || 0) + 1);
       }
       const isUsuallyNumeric = (paramStats.types.get('int') || 0) > 20 || (paramStats.types.get('uuid') || 0) > 20;
-      if (isUsuallyNumeric && currentType === 'string' && charClassRatio(strVal, /[^a-zA-Z0-9\s]/g) > 0.1) {
-        paramAnomalies.push(`Body param "${key}" type mutation (${[...paramStats.types.keys()].join(',')} -> suspicious string)`);
+      if (isUsuallyNumeric && currentType === 'string') {
+        const logicKeywords = /\b(OR|AND|UNION|SELECT|FROM|WHERE|LIKE|BETWEEN|WAITFOR|SLEEP)\b/i;
+        if (logicKeywords.test(strVal) || charClassRatio(strVal, /[^a-zA-Z0-9\s]/g) > 0.05) {
+          paramAnomalies.push(`Body param "${key}" type mutation with logic keywords (${strVal.substring(0, 20)})`);
+        }
       }
 
       if (strVal.length < 10) continue;
@@ -891,12 +974,21 @@ function analyze(decodedReq) {
     }
   }
 
+  const homoglyphs = Math.max(...candidates.map(c => detectHomoglyphs(c)));
+  if (homoglyphs > 0) {
+    add(WEIGHTS.evasion, 'homoglyph_evasion', `${homoglyphs} words with mixed latin/cyrillic detected (bypass attempt)`);
+  }
+
   if (maxEntropy > 4.5) {
     const ngramDev = Math.max(...candidates.map(c => calculateNgramDeviation(c)));
     if (ngramDev > 0.9) {
       add(WEIGHTS.linguistic_anomaly, 'linguistic_anomaly', 
         `High N-gram deviation (${ngramDev.toFixed(2)}) indicates obfuscated payload`);
     }
+  }
+
+  if (detectHeaderCRLFInjection(decodedReq)) {
+    add(WEIGHTS.protocol_smuggling, 'header_crlf_injection', 'CR/LF characters detected in HTTP headers (H2 Smuggling attempt)');
   }
 
   const smuggling = detectRequestSmuggling(decodedReq);
@@ -949,6 +1041,7 @@ function analyze(decodedReq) {
     _path: path,
     _paramEntropyUpdates: paramEntropyUpdates,
     _paramSpecialUpdates: paramSpecialUpdates,
+    _paramTypeUpdates: paramTypeUpdates,
     _shapeHash: shapeHash
   };
 }
@@ -961,12 +1054,14 @@ function check(decodedReq, responseTimeMs = 0) {
   // Payload Mutation & Evasion Tracking (Polymorphism / Fuzzing)
   if (result.score >= 5 && result.score < SCORE_THRESHOLD) {
     const mutationKey = `mutation:${decodedReq.ip}:${result._path}`;
-    const mutationCount = (MUTATION_CACHE.get(mutationKey) || 0) + 1;
-    MUTATION_CACHE.set(mutationKey, mutationCount);
+    const mutationData = MUTATION_CACHE.get(mutationKey) || { count: 0, ts: Date.now() };
+    mutationData.count += 1;
+    mutationData.ts = Date.now();
+    MUTATION_CACHE.set(mutationKey, mutationData);
     
-    if (mutationCount >= 3) {
+    if (mutationData.count >= 3) {
       result.score += 8; 
-      result.factors.push({ name: 'payload_mutation_fuzzing', detail: `${mutationCount} suspicious variants from same IP` });
+      result.factors.push({ name: 'payload_mutation_fuzzing', detail: `${mutationData.count} suspicious variants from same IP` });
       
       if (result.score >= CRITICAL_THRESHOLD) result.level = 'critical';
       else if (result.score >= SCORE_THRESHOLD) result.level = 'high';
@@ -1004,6 +1099,15 @@ function check(decodedReq, responseTimeMs = 0) {
     if (result._paramSpecialUpdates) {
       for (const [k, v] of result._paramSpecialUpdates) {
         getParamStats(stats, k).specialRatio.update(v);
+      }
+    }
+    if (result._paramTypeUpdates) {
+      for (const [typeKey, count] of result._paramTypeUpdates) {
+        const parts = typeKey.split(':');
+        const type = parts.pop();
+        const paramKey = parts.join(':');
+        const pStats = getParamStats(stats, paramKey);
+        pStats.types.set(type, count);
       }
     }
     if (result._shapeHash) {
