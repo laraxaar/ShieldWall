@@ -46,10 +46,237 @@ func main() {
 	certFile := flag.String("cert", "", "TLS certificate file (auto-generated if empty)")
 	keyFile := flag.String("key", "", "TLS private key file (auto-generated if empty)")
 	autoCert := flag.Bool("auto-cert", true, "Auto-generate self-signed cert for development")
-	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn")
+
+
+	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error, fatal")
 	flag.Parse()
 
-	logger := log.New(os.Stdout, "[shieldwall-gw] ", log.LstdFlags|log.Lmicroseconds)
+	logger := setupLogger(*logLevel)
+
+	// ── Banner ──────────────────────────────────────────────────────────
+	fmt.Println(`
+  ╔══════════════════════════════════════════════╗
+  ║  🛡️  ShieldWall TLS Fingerprint Gateway     ║
+  ║     Deep ClientHello Analysis + JA3/JA4     ║
+  ╚══════════════════════════════════════════════╝`)
+
+
+	// ── Parse backend URL ───────────────────────────────────────────────
+	backendURL, err := url.Parse(*backendAddr)
+	if err != nil {
+		logger.Fatal("Invalid backend URL %q: %v", *backendAddr, err)
+	}
+
+	// ── Load or generate TLS certificate ────────────────────────────────
+	var tlsCert tls.Certificate
+
+	if *certFile != "" && *keyFile != "" {
+		tlsCert, err = tls.LoadX509KeyPair(*certFile, *keyFile)
+		if err != nil {
+			logger.Fatal("Failed to load TLS certificate: %v", err)
+		}
+		logger.Infof("📜 Loaded TLS certificate from %s", *certFile)
+	} else if *autoCert {
+		// In development, auto-generate self-signed certificate
+		tlsCert, err = generateSelfSignedCert(logger)
+		if err != nil {
+			logger.Fatal("Failed to generate self-signed cert: %v", err)
+		}
+		logger.Info("📜 Generated self-signed certificate for development")
+	} else {
+		logger.Fatal("No TLS certificate specified. Use -cert/-key or -auto-cert")
+	}
+
+	// ── Initialize fingerprint store ────────────────────────────────────
+	fpStore := NewFingerprintStore()
+
+	// ── TLS configuration ───────────────────────────────────────────────
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"h2", "http/1.1"},
+		// Prefer TLS 1.3 cipher suites if available
+		CipherSuites: []uint16{
+			tls.TLS_AES_128_GCM_SHA256,
+			tls.TLS_AES_256_GCM_SHA384,
+			tls.TLS_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		},
+		PreferServerCipherSuites: true,
+		CurvePreferences:         []tls.CurveID{
+			tls.X25519,
+			tls.CurveP256,
+			tls.CurveP384,
+		},
+	}
+
+	// ── Start TCP listener ──────────────────────────────────────────────
+	tcpListener, err := net.Listen("tcp", *listenAddr)
+	if err != nil {
+		logger.Fatal("Failed to listen on %s: %v", *listenAddr, err)
+	}
+
+	// ── Create intercepting listener + reverse proxy ────────────────────
+	interceptor := NewTLSInterceptor(tcpListener, tlsConfig, fpStore, logger)
+	proxy := CreateReverseProxy(backendURL, fpStore, logger)
+
+	server := &http.Server{
+		Handler:           proxy,
+		ReadTimeout:       30 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		ErrorLog:          log.New(logger.out, "HTTP_SERVER_ERROR: ", log.LstdFlags|log.Lmicroseconds),
+	}
+
+	// ── Graceful shutdown ───────────────────────────────────────────────
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		sig := <-sigCh
+		logger.Warnf("Received %v, shutting down...", sig)
+		cancel()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			logger.Errorf("Server shutdown error: %v", err)
+		}
+	}()
+
+	// ── Print startup info ──────────────────────────────────────────────
+	logger.Infof("🔒 Listening on https://localhost%s", *listenAddr)
+	logger.Infof("🔗 Proxying to backend: %s", *backendAddr)
+	logger.Infof("📊 Log level: %s", *logLevel)
+	fmt.Println()
+	logger.Info("Headers injected into every proxied request:")
+	fmt.Println("   ├─ X-JA3-Fingerprint    (raw JA3 string)")
+	fmt.Println("   ├─ X-JA3-Hash           (MD5 digest)")
+	fmt.Println("   ├─ X-JA4-Fingerprint    (JA4-style hash)")
+	fmt.Println("   ├─ X-ALPN               (negotiated protocol)")
+	fmt.Println("   ├─ X-TLS-Version        (highest TLS version)")
+	fmt.Println("   ├─ X-TLS-Random-Entropy (Shannon entropy 0-8)")
+	fmt.Println("   ├─ X-TLS-Has-GREASE     (GREASE value presence)")
+	fmt.Println("   ├─ X-TLS-Cipher-Count   (offered cipher count)")
+	fmt.Println("   ├─ X-TLS-Extension-Count")
+	fmt.Println("   ├─ X-TLS-SNI            (Server Name Indication)")
+	fmt.Println("   └─ X-Forwarded-For      (real client IP)")
+	fmt.Println()
+
+	// ── Serve ───────────────────────────────────────────────────────────
+	logger.Infof("🚀 Gateway started, press Ctrl+C to stop...")
+	if err := server.Serve(interceptor); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		logger.Fatal("Server error: %v", err)
+	}
+
+	logger.Info("Gateway stopped")
+
+
+	// ── Banner ──────────────────────────────────────────────────────────
+	fmt.Println(`
+  ╔══════════════════════════════════════════════╗
+  ║  🛡️  ShieldWall TLS Fingerprint Gateway     ║
+  ║     Deep ClientHello Analysis + JA3/JA4     ║
+  ╚══════════════════════════════════════════════╝`)
+
+	// ── Parse backend URL ───────────────────────────────────────────────
+	backendURL, err := url.Parse(*backendAddr)
+	if err != nil {
+		logger.Fatalf("Invalid backend URL %q: %v", *backendAddr, err)
+	}
+
+	// ── Load or generate TLS certificate ────────────────────────────────
+	var tlsCert tls.Certificate
+
+	if *certFile != "" && *keyFile != "" {
+		tlsCert, err = tls.LoadX509KeyPair(*certFile, *keyFile)
+		if err != nil {
+			logger.Fatalf("Failed to load TLS certificate: %v", err)
+		}
+		logger.Printf("📜 Loaded TLS certificate from %s", *certFile)
+	} else if *autoCert {
+		tlsCert, err = generateSelfSignedCert(logger)
+		if err != nil {
+			logger.Fatalf("Failed to generate self-signed cert: %v", err)
+		}
+		logger.Println("📜 Generated self-signed certificate for development")
+	} else {
+		logger.Fatal("No TLS certificate specified. Use -cert/-key or -auto-cert")
+	}
+
+	// ── Initialize fingerprint store ────────────────────────────────────
+	fpStore := NewFingerprintStore()
+
+	// ── TLS configuration ───────────────────────────────────────────────
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"h2", "http/1.1"},
+	}
+
+	// ── Start TCP listener ──────────────────────────────────────────────
+	tcpListener, err := net.Listen("tcp", *listenAddr)
+	if err != nil {
+		logger.Fatalf("Failed to listen on %s: %v", *listenAddr, err)
+	}
+
+	// ── Create intercepting listener + reverse proxy ────────────────────
+	interceptor := NewTLSInterceptor(tcpListener, tlsConfig, fpStore, logger)
+	proxy := CreateReverseProxy(backendURL, fpStore, logger)
+
+	server := &http.Server{
+		Handler:           proxy,
+		ReadTimeout:       30 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	// ── Graceful shutdown ───────────────────────────────────────────────
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		sig := <-sigCh
+		logger.Printf("Received %v, shutting down...", sig)
+		cancel()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		server.Shutdown(shutdownCtx)
+	}()
+
+	// ── Print startup info ──────────────────────────────────────────────
+	logger.Printf("🔒 Listening on https://localhost%s", *listenAddr)
+	logger.Printf("🔗 Proxying to backend: %s", *backendAddr)
+	logger.Printf("📊 Log level: %s", *logLevel)
+	fmt.Println()
+	logger.Println("Headers injected into every proxied request:")
+	fmt.Println("   ├─ X-JA3-Fingerprint    (raw JA3 string)")
+	fmt.Println("   ├─ X-JA3-Hash           (MD5 digest)")
+	fmt.Println("   ├─ X-JA4-Fingerprint    (JA4-style hash)")
+	fmt.Println("   ├─ X-ALPN               (negotiated protocol)")
+	fmt.Println("   ├─ X-TLS-Version        (highest TLS version)")
+	fmt.Println("   ├─ X-TLS-Random-Entropy (Shannon entropy 0-8)")
+	fmt.Println("   ├─ X-TLS-Has-GREASE     (GREASE value presence)")
+	fmt.Println("   ├─ X-TLS-Cipher-Count   (offered cipher count)")
+	fmt.Println("   ├─ X-TLS-Extension-Count")
+	fmt.Println("   ├─ X-TLS-SNI            (Server Name Indication)")
+	fmt.Println("   └─ X-Forwarded-For      (real client IP)")
+	fmt.Println()
+
+
+
+	// ── Serve ───────────────────────────────────────────────────────────
+	if err := server.Serve(interceptor); err != nil && err != http.ErrServerClosed {
+		logger.Fatalf("Server error: %v", err)
+	}
+
+	logger.Println("Gateway stopped")
 
 	// ── Banner ──────────────────────────────────────────────────────────
 	fmt.Println(`
