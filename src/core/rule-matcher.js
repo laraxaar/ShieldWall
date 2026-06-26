@@ -35,8 +35,37 @@ const TARGET_MAP = {
 };
 
 /**
+ * Validates a RegExp pattern for potential ReDoS vulnerabilities.
+ * Detects dangerous nested quantifiers that can cause exponential backtracking.
+ * @param {string} pattern - The RegExp pattern to validate.
+ * @returns {boolean} True if the pattern is safe, false if it contains dangerous patterns.
+ */
+function _isSafeRegExp(pattern) {
+  // Check for nested quantifiers like (a+)+, (a*)*, (a+)*, etc.
+  const nestedQuantifierRegex = /(\([^)]*[\*\+][^)]*\)[\*\+])|(\[[^\]]*[\*\+][^\]]*\][\*\+])/;
+  if (nestedQuantifierRegex.test(pattern)) {
+    return false;
+  }
+
+  // Check for overlapping quantifiers in alternations like (a+|b+)+
+  const overlappingQuantifierRegex = /\([^)]*\|[^)]*\)[\*\+]/;
+  if (overlappingQuantifierRegex.test(pattern)) {
+    return false;
+  }
+
+  // Check for excessive repetition depth (more than 3 consecutive quantifiers)
+  const consecutiveQuantifiers = /([\*\+\?]{4,})/;
+  if (consecutiveQuantifiers.test(pattern)) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
  * Transforms nested objects into a flat string representation safely.
  * FP MITIGATION: Resolves crashes where arrays/objects in GraphQL/JSON are fed to Object.entries.
+ * PROTOTYPE POLLUTION PROTECTION: Blocks dangerous keys that could pollute Object.prototype.
  * @param {any} val - The value to stringify.
  * @returns {string} Safe flattened string.
  */
@@ -44,7 +73,11 @@ function _safeStringify(val) {
   if (typeof val === 'string') return val;
   if (Array.isArray(val)) return val.map(_safeStringify).join(',');
   if (val !== null && typeof val === 'object') {
-    return Object.entries(val).map(([k, v]) => `${k}=${_safeStringify(v)}`).join('&');
+    const blockedKeys = ['__proto__', 'constructor', 'prototype'];
+    return Object.entries(val)
+      .filter(([k]) => !blockedKeys.includes(k))
+      .map(([k, v]) => `${k}=${_safeStringify(v)}`)
+      .join('&');
   }
   return String(val || '');
 }

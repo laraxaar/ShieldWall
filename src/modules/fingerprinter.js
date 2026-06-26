@@ -28,8 +28,32 @@ const HOSTING_ASN = new Set([14061, 16509, 24940, 13335, 15169]);
 
 const isGrease = (v) => Number.isInteger(v) && ((v >> 8) === (v & 0xFF)) && ((v & 0x0F) === 0x0A);
 
+/**
+ * Validates if a string is a valid IPv4 or IPv6 address.
+ * FIX: BUG_34 — Helper function for IP validation.
+ * @param {string} ip - The IP string to validate.
+ * @returns {boolean} True if valid IP format.
+ */
+function _isValidIP(ip) {
+    if (!ip || typeof ip !== 'string') return false;
+    // IPv4 regex
+    const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+    if (ipv4Regex.test(ip)) return true;
+    // IPv6 regex (simplified)
+    const ipv6Regex = /^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$/;
+    return ipv6Regex.test(ip);
+}
+
+/**
+ * Parses JA3 fingerprint string into components.
+ * FIX: BUG_36 — Added length validation to prevent DoS via oversized strings.
+ * @param {string} ja3 - JA3 fingerprint string.
+ * @returns {Object|null} Parsed components or null if invalid.
+ */
 function parseJa3(ja3) {
     if (!ja3 || typeof ja3 !== 'string') return null;
+    // FIX: BUG_36 — Reject oversized strings to prevent DoS
+    if (ja3.length > 1000) return null;
     const p = ja3.split(',');
     if (p.length < 2) return null;
     const parseList = (s) => s ? s.split('-').map(Number).filter(Number.isFinite) : [];
@@ -82,8 +106,22 @@ function classify(score, threshold) {
     return 'clean';
 }
 
+/**
+ * Analyzes request for TLS fingerprint anomalies.
+ * FIX: BUG_34 — Added IP validation to prevent IP spoofing.
+ * FIX: BUG_35 — Added headers validation to prevent prototype pollution.
+ * @param {Object} req - HTTP request object.
+ * @param {Object} config - Configuration object.
+ * @param {Object} tracker - Fingerprint tracker instance.
+ * @returns {Object} Analysis result with suspect score and classification.
+ */
 function _analyzeRequest(req, config, tracker) {
     try {
+        // FIX: BUG_35 — Validate headers structure to prevent prototype pollution
+        if (!req.headers || typeof req.headers !== 'object') {
+            return { suspectScore: 0, signals: ['E_INVALID_HEADERS'], classification: 'unknown' };
+        }
+
         const gatewaySecret = req.headers['x-gateway-auth'];
         const isTrustedGateway = gatewaySecret === process.env.GATEWAY_SECRET;
 
@@ -96,7 +134,10 @@ function _analyzeRequest(req, config, tracker) {
         const parts = parseJa3(ja3);
         if (!parts) return { suspectScore: 0, signals: ['E_INVALID_JA3'], classification: 'unknown' };
 
-        const clientIp = req.ip || req.socket?.remoteAddress || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown';
+        // FIX: BUG_34 — Validate IP before using in clientIp
+        const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+        const forwarded = req.headers['x-forwarded-for']?.split(',')[0]?.trim();
+        const clientIp = _isValidIP(forwarded) ? forwarded : (_isValidIP(ip) ? ip : 'unknown');
         const ua = (req.headers['user-agent'] || '').toLowerCase();
         const h2 = extractH2Fingerprint(req);
         const alpn = getAlpn(req);

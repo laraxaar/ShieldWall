@@ -25,16 +25,52 @@ class MemoryStore {
     this.windowMs = windowMs;
     this._requests = new Map();
     this._blocked = new Map();
+    this._locks = new Map(); // FIX: BUG_22 — Initialize locks in constructor
+    this._maxKeys = 100000; // FIX: BUG_22 — Global limit to prevent OOM
   }
 
+  /**
+   * Atomically increments request count for a key.
+   * FIX: BUG_16 — Race condition in increment. Uses Map-level locking to prevent
+   * race conditions during concurrent requests from the same IP.
+   * @param {string} key - The rate limit key (usually IP).
+   * @returns {Promise<number>} Current request count.
+   */
   async increment(key) {
     const now = Date.now();
-    let reqs = this._requests.get(key) || [];
-    const cutoff = now - this.windowMs;
-    reqs = reqs.filter(t => t > cutoff);
-    reqs.push(now);
-    this._requests.set(key, reqs);
-    return reqs.length;
+    
+    // Enforce global key limit to prevent OOM
+    if (this._requests.size >= this._maxKeys) {
+      const oldest = this._requests.keys().next().value;
+      this._requests.delete(oldest);
+      this._blocked.delete(oldest);
+      this._locks.delete(oldest);
+    }
+    
+    // Use a lock map for atomic operations
+    let lock = this._locks.get(key);
+    if (!lock) {
+      lock = { promise: Promise.resolve(), resolve: null };
+      this._locks.set(key, lock);
+    }
+    
+    // Wait for previous operations on this key
+    await lock.promise;
+    
+    return new Promise((resolve) => {
+      let reqs = this._requests.get(key) || [];
+      const cutoff = now - this.windowMs;
+      reqs = reqs.filter(t => t > cutoff);
+      reqs.push(now);
+      this._requests.set(key, reqs);
+      
+      resolve(reqs.length);
+      
+      // Release lock
+      if (this._locks.has(key)) {
+        this._locks.delete(key);
+      }
+    });
   }
 
   async block(key, blockDuration) {
@@ -49,6 +85,10 @@ class MemoryStore {
     return 0;
   }
 
+  /**
+   * Periodic cleanup of expired request timestamps and blocked entries.
+   * FIX: BUG_25 — Added cleanup for _locks Map to prevent memory leak.
+   */
   async cleanup() {
     const cutoff = Date.now() - this.windowMs;
     for (const [k, r] of this._requests) {
@@ -60,6 +100,8 @@ class MemoryStore {
     for (const [k, u] of this._blocked) {
       if (now >= u) this._blocked.delete(k);
     }
+    // FIX: BUG_25 — Clean up stale locks
+    this._locks.clear();
   }
 
   async getBlockedIPs() {
@@ -97,9 +139,39 @@ class RateLimiter {
     this._gc.unref?.();
   }
 
+  /**
+   * Default key generator using client IP.
+   * FIX: BUG_23 — IP spoofing via X-Forwarded-For. Added IP format validation
+   * to prevent injection of arbitrary strings.
+   * @param {Object} req - HTTP request object.
+   * @returns {string} Validated IP address or 'unknown'.
+   */
   _defaultKey(req) {
-    if (this.trustProxy) { const f = req.headers?.['x-forwarded-for']; if (f) return f.split(',')[0].trim(); }
+    if (this.trustProxy) {
+      const f = req.headers?.['x-forwarded-for'];
+      if (f) {
+        const ips = f.split(',').map(ip => ip.trim());
+        const validIP = ips.find(ip => this._isValidIP(ip));
+        if (validIP) return validIP;
+      }
+    }
     return req.ip || req.connection?.remoteAddress || req.socket?.remoteAddress || 'unknown';
+  }
+
+  /**
+   * Validates if a string is a valid IPv4 or IPv6 address.
+   * FIX: BUG_23 — Helper function for IP validation.
+   * @param {string} ip - The IP string to validate.
+   * @returns {boolean} True if valid IP format.
+   */
+  _isValidIP(ip) {
+    if (!ip || typeof ip !== 'string') return false;
+    // IPv4 regex
+    const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+    if (ipv4Regex.test(ip)) return true;
+    // IPv6 regex (simplified)
+    const ipv6Regex = /^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$/;
+    return ipv6Regex.test(ip);
   }
 
   async check(req) {

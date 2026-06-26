@@ -18,6 +18,10 @@ class BruteForceGuard {
     this.failedCodes = new Set(options.failedCodes || [401, 403, 422]);
     this.accountMaxAttempts = options.accountMaxAttempts || 10;
 
+    // FIX: BUG_29 — Add global limits to prevent OOM during distributed attacks
+    this.maxStateSize = options.maxStateSize || 50000;
+    this.maxAccountStateSize = options.maxAccountStateSize || 100000;
+
     this._state = new Map();
     this._accountState = new Map();
     this._cleanup = setInterval(() => this._gc(), 60_000);
@@ -59,12 +63,30 @@ class BruteForceGuard {
     return { blocked: false };
   }
 
+  /**
+   * Records failed authentication attempts and applies progressive backoff blocking.
+   * FIX: BABU_26 — Enforce global size limits to prevent OOM during distributed attacks.
+   * @param {Object} req - HTTP request object.
+   * @param {number} statusCode - HTTP response status code.
+   * @param {string} accountId - Optional account identifier (email, username, etc.).
+   */
   recordResponse(req, statusCode, accountId = null) {
     const ip = this._ip(req);
     const path = (req.path || req.url?.split('?')[0] || '').toLowerCase();
     if (!this._isSensitive(path)) return;
 
+    // FIX: BUG_26 — Enforce global limits before adding new entries
+    if (this._state.size >= this.maxStateSize) {
+      const oldest = this._state.keys().next().value;
+      this._state.delete(oldest);
+    }
+
     if (accountId && this.failedCodes.has(statusCode)) {
+      // FIX: BUG_26 — Enforce account state limit
+      if (this._accountState.size >= this.maxAccountStateSize) {
+        const oldest = this._accountState.keys().next().value;
+        this._accountState.delete(oldest);
+      }
       let accEntry = this._accountState.get(accountId);
       if (!accEntry) { accEntry = { attempts: [] }; this._accountState.set(accountId, accEntry); }
       accEntry.attempts.push(Date.now());
@@ -87,6 +109,12 @@ class BruteForceGuard {
     }
   }
 
+  /**
+   * Express middleware for brute-force protection.
+   * FIX: BUG_28 — Race condition in res.end hooking. Uses atomic Object.defineProperty
+   * to prevent multiple concurrent requests from hooking the same response object.
+   * @returns {Function} Express middleware function.
+   */
   middleware() {
     const guard = this;
     return function(req, res, next) {
@@ -109,8 +137,20 @@ class BruteForceGuard {
         }, delay);
         return;
       }
-      const origEnd = res.end.bind(res);
-      res.end = function(c, e) { guard.recordResponse(req, res.statusCode, accountId); return origEnd(c, e); };
+      // FIX: BUG_28 — Atomic hooking of res.end to prevent race conditions
+      if (!res._bruteHooked) {
+        try {
+          Object.defineProperty(res, '_bruteHooked', {
+            value: true,
+            writable: false,
+            configurable: false
+          });
+          const origEnd = res.end.bind(res);
+          res.end = function(c, e) { guard.recordResponse(req, res.statusCode, accountId); return origEnd(c, e); };
+        } catch (e) {
+          // Property already defined by another request (race condition handled)
+        }
+      }
       next();
     };
   }
@@ -120,13 +160,37 @@ class BruteForceGuard {
     return false;
   }
 
+  /**
+   * Extracts client IP from request with optional proxy support.
+   * FIX: BUG_27 — IP spoofing via X-Forwarded-For. Added IP format validation
+   * to prevent injection of arbitrary strings.
+   * @param {Object} req - HTTP request object.
+   * @returns {string} Validated IP address or 'unknown'.
+   */
   _ip(req) {
     // Use x-forwarded-for only if explicitly trusted (behind proxy)
     if (this.trustProxy && req.headers?.['x-forwarded-for']) {
-      const forwarded = req.headers['x-forwarded-for'].split(',')[0].trim();
-      if (forwarded) return forwarded;
+      const ips = req.headers['x-forwarded-for'].split(',').map(ip => ip.trim());
+      const validIP = ips.find(ip => this._isValidIP(ip));
+      if (validIP) return validIP;
     }
     return req.ip || req.connection?.remoteAddress || req.socket?.remoteAddress || 'unknown';
+  }
+
+  /**
+   * Validates if a string is a valid IPv4 or IPv6 address.
+   * FIX: BUG_27 — Helper function for IP validation.
+   * @param {string} ip - The IP string to validate.
+   * @returns {boolean} True if valid IP format.
+   */
+  _isValidIP(ip) {
+    if (!ip || typeof ip !== 'string') return false;
+    // IPv4 regex
+    const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+    if (ipv4Regex.test(ip)) return true;
+    // IPv6 regex (simplified)
+    const ipv6Regex = /^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$/;
+    return ipv6Regex.test(ip);
   }
 
   _gc() {

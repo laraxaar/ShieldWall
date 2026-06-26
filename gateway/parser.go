@@ -53,6 +53,22 @@ func IsGREASE(v uint16) bool {
 	return (v>>8) == (v&0xFF) && (v&0x0F) == 0x0A
 }
 
+// validateRecordLength validates TLS record length with additional DoS protections.
+// FIX: BUG_14 — Added suspicious size detection to prevent DoS via multiple small records.
+func validateRecordLength(recordLen int) error {
+	if recordLen < 4 {
+		return fmt.Errorf("invalid TLS record length: %d (too small)", recordLen)
+	}
+	if recordLen > 16384 {
+		return fmt.Errorf("invalid TLS record length: %d (too large)", recordLen)
+	}
+	// Additional check: reject suspicious sizes often used in attacks
+	if recordLen > 8192 && recordLen%256 != 0 {
+		return fmt.Errorf("suspicious TLS record length: %d", recordLen)
+	}
+	return nil
+}
+
 // ── Raw ClientHello capture from TCP ────────────────────────────────────────
 
 // ReadClientHello reads the first TLS record from a TCP connection and parses
@@ -70,8 +86,9 @@ func ReadClientHello(conn net.Conn) ([]byte, *ClientHello, error) {
 	}
 
 	recordLen := int(binary.BigEndian.Uint16(header[3:5]))
-	if recordLen < 4 || recordLen > 16384 {
-		return header, nil, fmt.Errorf("invalid TLS record length: %d", recordLen)
+	// FIX: BUG_14 — Use enhanced validation to prevent DoS via suspicious record sizes
+	if err := validateRecordLength(recordLen); err != nil {
+		return header, nil, err
 	}
 
 	// Step 2: Read the full handshake payload

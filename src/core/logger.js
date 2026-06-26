@@ -197,7 +197,8 @@ class Logger {
         }
         console.log(`\x1b[90m${bar}${RESET}`);
         console.log(`☣️ Trigger Payload:`);
-        console.log(`\x1b[90m${entry.payload}${RESET}`);
+        // FIX: BUG_18 — Sanitize payload to prevent log injection
+        console.log(`\x1b[90m${this._sanitizeForLog(entry.payload)}${RESET}`);
         console.log(`\x1b[90m${bar}${RESET}`);
         console.log(`⏰ Timestamp: ${entry.timestamp}\n`);
 
@@ -241,6 +242,23 @@ class Logger {
   }
 
   getHistory(count = 100) { return this.history.slice(-count); }
+
+  /**
+   * Sanitizes a string for safe logging.
+   * FIX: BUG_18 — Log injection vulnerability. Removes control characters and
+   * escapes special sequences to prevent log forging and injection.
+   * @param {string} str - The string to sanitize.
+   * @returns {string} Sanitized string.
+   */
+  _sanitizeForLog(str) {
+    if (typeof str !== 'string') return String(str);
+    
+    // Remove control characters except newline/tab
+    return str
+      .replace(/[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]/g, '')
+      .replace(/[\n\r]/g, ' ')
+      .substring(0, 1000); // Limit length
+  }
 
   getStats() {
     const attacks = this.history.filter(e => e.type === 'attack');

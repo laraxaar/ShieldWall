@@ -201,12 +201,42 @@ class SmartAnomalyDetector {
     return String(str).toLowerCase();
   }
 
+  /**
+   * Extracts and normalizes request features for anomaly detection.
+   * DOS PROTECTION: Enforces strict limit on maximum extracted elements to prevent
+   * resource exhaustion attacks with deeply nested or large payloads.
+   * @param {Object} decodedReq - The decoded request object.
+   * @returns {Object} Normalized feature set for analysis.
+   */
   _extractRequestFeatures(decodedReq) {
+    const MAX_EXTRACTED_ELEMENTS = 1000;
+    let extractedCount = 0;
+
     const extractValues = (obj, depth = 0) => {
       if (depth > 5) return [];
-      if (typeof obj === 'string') return [obj];
-      if (Array.isArray(obj)) return obj.flatMap(v => extractValues(v, depth + 1));
-      if (obj && typeof obj === 'object') return Object.values(obj).flatMap(v => extractValues(v, depth + 1));
+      if (extractedCount >= MAX_EXTRACTED_ELEMENTS) return [];
+      
+      if (typeof obj === 'string') {
+        extractedCount++;
+        return [obj];
+      }
+      if (Array.isArray(obj)) {
+        const result = [];
+        for (const v of obj) {
+          if (extractedCount >= MAX_EXTRACTED_ELEMENTS) break;
+          result.push(...extractValues(v, depth + 1));
+        }
+        return result;
+      }
+      if (obj && typeof obj === 'object') {
+        const result = [];
+        for (const v of Object.values(obj)) {
+          if (extractedCount >= MAX_EXTRACTED_ELEMENTS) break;
+          result.push(...extractValues(v, depth + 1));
+        }
+        return result;
+      }
+      extractedCount++;
       return [String(obj || '')];
     };
 

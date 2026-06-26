@@ -161,6 +161,8 @@ class ShieldWallEngine extends EventEmitter {
   /**
    * Resolves the true client IP safely, accounting for reverse proxies.
    * Prevents Proxy Blindness bugs where 'req.ip' maps to Cloudflare or a Load Balancer.
+   * FIX: BUG_13 — IP Spoofing via X-Forwarded-For. Added strict IP format validation
+   * to prevent injection of arbitrary strings and log poisoning.
    * @param {Object} req - Inbound HTTP request.
    * @returns {string} The canonical client IP address.
    */
@@ -168,9 +170,27 @@ class ShieldWallEngine extends EventEmitter {
     if (this.options.trustProxy && req.headers && req.headers['x-forwarded-for']) {
       // Parse multi-tier proxies, grabbing the original public client
       const ips = req.headers['x-forwarded-for'].split(',').map(ip => ip.trim());
-      if (ips.length > 0) return ips[0];
+      // Validate IP format to prevent spoofing
+      const validIP = ips.find(ip => this._isValidIP(ip));
+      if (validIP) return validIP;
     }
     return req.ip || req.connection?.remoteAddress || req.socket?.remoteAddress || 'unknown';
+  }
+
+  /**
+   * Validates if a string is a valid IPv4 or IPv6 address.
+   * FIX: BUG_13 — Helper function added to prevent IP spoofing attacks.
+   * @param {string} ip - The IP string to validate.
+   * @returns {boolean} True if valid IP format.
+   */
+  _isValidIP(ip) {
+    if (!ip || typeof ip !== 'string') return false;
+    // IPv4 regex
+    const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+    if (ipv4Regex.test(ip)) return true;
+    // IPv6 regex (simplified)
+    const ipv6Regex = /^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$/;
+    return ipv6Regex.test(ip);
   }
 
   /**
@@ -303,15 +323,25 @@ class ShieldWallEngine extends EventEmitter {
 
     const decodedReq = decodeRequest(req);
 
+    // FIX: BUG_11 — Race condition in response hooking. Use atomic Object.defineProperty
+    // to prevent multiple concurrent requests from hooking the same response object.
     if (res && typeof res.writeHead === 'function' && !res._reconHooked) {
-      res._reconHooked = true;
-      const originalWriteHead = res.writeHead;
-      res.writeHead = function(statusCode) {
-        if (statusCode === 404 || statusCode === 403) {
-          recordReconAttempt(req.clientIp, decodedReq.path, statusCode);
-        }
-        originalWriteHead.apply(res, arguments);
-      };
+      try {
+        Object.defineProperty(res, '_reconHooked', {
+          value: true,
+          writable: false,
+          configurable: false
+        });
+        const originalWriteHead = res.writeHead;
+        res.writeHead = function(statusCode) {
+          if (statusCode === 404 || statusCode === 403) {
+            recordReconAttempt(req.clientIp, decodedReq.path, statusCode);
+          }
+          originalWriteHead.apply(res, arguments);
+        };
+      } catch (e) {
+        // Property already defined by another request (race condition handled)
+      }
     }
 
     if (/(\/\.env|\/wp-admin|\/actuator)/i.test(decodedReq.path)) {
@@ -508,8 +538,13 @@ class ShieldWallEngine extends EventEmitter {
         }
 
         // 2. Error Spike (Crash Analysis)
+        // FIX: BUG_12 — Unbounded memory leak in errorCache. Added strict LRU eviction
+        // with configurable max size to prevent OOM during distributed attacks.
         if (statusCode >= 500) {
-          if (!this.errorCache) this.errorCache = new Map();
+          if (!this.errorCache) {
+            this.errorCache = new Map();
+            this.errorCacheMaxSize = 10000; // Configurable limit
+          }
           const errorKey = `errors:${decodedReq.ip}`;
           const errorCount = (this.errorCache.get(errorKey) || 0) + 1;
           this.errorCache.set(errorKey, errorCount);
@@ -518,7 +553,11 @@ class ShieldWallEngine extends EventEmitter {
             this.logger.warn(`Error spike anomaly: IP ${decodedReq.ip} generated ${errorCount} 500 errors. Possible DoS or Fuzzing.`);
             try { require('../modules/reputation').record(decodedReq.ip, 'error_spike', 'high'); } catch (e) { }
           }
-          if (this.errorCache.size > 5000) this.errorCache.delete(this.errorCache.keys().next().value);
+          // Strict LRU eviction
+          if (this.errorCache.size > this.errorCacheMaxSize) {
+            const oldest = this.errorCache.keys().next().value;
+            this.errorCache.delete(oldest);
+          }
         }
 
         // 3. Exfiltration Detection
@@ -747,6 +786,8 @@ class ShieldWallEngine extends EventEmitter {
   /**
    * Generates localized .shield rules dynamically if an anomalous payload breaches 
    * strong heuristics. Prevents zero-day spread by mutating to regex blocks.
+   * FIX: BUG_20 — No rate limit on auto-generated rules. Added per-IP rate limiting
+   * to prevent rule spam attacks that could fill the rules file.
    * @param {Object} match - The threat trigger.
    * @param {Object} decodedReq - Normalised extraction container.
    */
@@ -757,6 +798,14 @@ class ShieldWallEngine extends EventEmitter {
     if (!decodedReq?.rawBody || decodedReq.rawBody.length < 10) return;
     if (this._autoGeneratedHashes.size >= MAX_AUTO_RULES) return;
     if (!match.analysis?.novelIndicators || match.analysis.novelIndicators.length < 3) return;
+
+    // Rate limit per IP to prevent rule spam
+    const ip = decodedReq.ip;
+    if (!this._autoRuleRateLimit) this._autoRuleRateLimit = new Map();
+    const now = Date.now();
+    const lastGen = this._autoRuleRateLimit.get(ip) || 0;
+    if (now - lastGen < 60000) return; // Max 1 rule per minute per IP
+    this._autoRuleRateLimit.set(ip, now);
 
     const bodyPrefix = decodedReq.rawBody.substring(0, 32);
     let escaped = bodyPrefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');

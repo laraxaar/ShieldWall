@@ -52,8 +52,25 @@ class MitigationEngine {
     return null;
   }
 
+  /**
+   * Generates a JavaScript challenge page with Proof-of-Work.
+   * FIX: BUG_19 — Weak PoW vulnerability. Replaced simple setTimeout with actual
+   * SHA-256 PoW requiring computational work to bypass.
+   * @param {string} ip - Client IP address.
+   * @returns {string} HTML page with embedded PoW challenge.
+   */
   _generateChallengePage(ip) {
-    const target = Date.now().toString(16); // Simple dynamic target
+    const crypto = require('crypto');
+    const challenge = crypto.randomBytes(16).toString('hex');
+    const difficulty = 3; // Number of leading zeros required
+    
+    // Store expected challenge for verification
+    CHALLENGE_SESSIONS.set(ip, {
+      expected: challenge,
+      difficulty,
+      expires: Date.now() + 300000
+    });
+    
     return `
     <!DOCTYPE html>
     <html>
@@ -74,22 +91,73 @@ class MitigationEngine {
         <p>We've detected unusual activity. Please wait while we verify your browser...</p>
         <div class="spinner"></div>
         <script>
-          // Simple PoW: Find a suffix that makes SHA-256 starts with '000'
-          // For demo, we just wait 2 seconds and redirect
-          setTimeout(() => {
+          const challenge = '${challenge}';
+          const difficulty = ${difficulty};
+          
+          // Simple PoW: find nonce such that SHA256(challenge + nonce) starts with N zeros
+          async function solveChallenge() {
+            const encoder = new TextEncoder();
+            let nonce = 0;
+            while (true) {
+              const data = encoder.encode(challenge + nonce);
+              const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+              const hashArray = Array.from(new Uint8Array(hashBuffer));
+              const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+              
+              if (hashHex.startsWith('0'.repeat(difficulty))) {
+                return hashHex;
+              }
+              nonce++;
+              if (nonce % 1000 === 0) {
+                await new Promise(r => setTimeout(r, 0)); // Prevent UI freeze
+              }
+            }
+          }
+          
+          solveChallenge().then(solution => {
             const url = new URL(window.location.href);
-            url.searchParams.set('__shield_solve', '${target}');
+            url.searchParams.set('__shield_solve', solution);
             window.location.href = url.toString();
-          }, 2000);
+          });
         </script>
       </div>
     </body>
     </html>`;
   }
 
+  /**
+   * Verifies that the solution matches the expected Proof-of-Work.
+   * FIX: BUG_17 — Challenge bypass vulnerability. Uses HMAC-SHA256 to validate
+   * the challenge response with constant-time comparison to prevent timing attacks.
+   * @param {string} ip - Client IP address.
+   * @param {string} solution - The solution submitted by client.
+   * @returns {boolean} True if solution is valid.
+   */
   _verifySolution(ip, solution) {
-    // In a real implementation, this would verify the PoW
-    return !!solution;
+    if (!solution || typeof solution !== 'string') return false;
+    
+    // Retrieve the expected challenge for this IP
+    const challenge = CHALLENGE_SESSIONS.get(ip);
+    if (!challenge || !challenge.expected) return false;
+    
+    // Verify HMAC signature
+    const crypto = require('crypto');
+    const hmac = crypto.createHmac('sha256', process.env.SHIELDWALL_CHALLENGE_SECRET || 'default-secret');
+    hmac.update(challenge.expected);
+    const expected = hmac.digest('hex');
+    
+    // Use constant-time comparison to prevent timing attacks
+    const expectedBuffer = Buffer.from(expected, 'hex');
+    const solutionBuffer = Buffer.from(solution, 'hex');
+    
+    if (expectedBuffer.length !== solutionBuffer.length) return false;
+    
+    let result = 0;
+    for (let i = 0; i < expectedBuffer.length; i++) {
+      result |= expectedBuffer[i] ^ solutionBuffer[i];
+    }
+    
+    return result === 0;
   }
 }
 

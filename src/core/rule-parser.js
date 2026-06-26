@@ -123,6 +123,34 @@ class Lexer {
   }
 }
 
+/**
+ * Validates a RegExp pattern for potential ReDoS vulnerabilities.
+ * Detects dangerous nested quantifiers that can cause exponential backtracking.
+ * @param {string} pattern - The RegExp pattern to validate.
+ * @returns {boolean} True if the pattern is safe, false if it contains dangerous patterns.
+ */
+function _isSafeRegExp(pattern) {
+  // Check for nested quantifiers like (a+)+, (a*)*, (a+)*, etc.
+  const nestedQuantifierRegex = /(\([^)]*[\*\+][^)]*\)[\*\+])|(\[[^\]]*[\*\+][^\]]*\][\*\+])/;
+  if (nestedQuantifierRegex.test(pattern)) {
+    return false;
+  }
+
+  // Check for overlapping quantifiers in alternations like (a+|b+)+
+  const overlappingQuantifierRegex = /\([^)]*\|[^)]*\)[\*\+]/;
+  if (overlappingQuantifierRegex.test(pattern)) {
+    return false;
+  }
+
+  // Check for excessive repetition depth (more than 3 consecutive quantifiers)
+  const consecutiveQuantifiers = /([\*\+\?]{4,})/;
+  if (consecutiveQuantifiers.test(pattern)) {
+    return false;
+  }
+
+  return true;
+}
+
 class Parser {
   constructor(tokens) { this.tokens = tokens; this.pos = 0; }
   error(msg) { const t = this.tokens[this.pos] || { line: '?' }; throw new Error(`[ShieldWall] Parse error at line ${t.line}: ${msg}`); }
@@ -154,9 +182,16 @@ class Parser {
 
     for (const [key, def] of Object.entries(rule.strings)) {
       try {
+        const pattern = def.type === 'regex' ? def.pattern : def.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        
+        // Validate pattern for ReDoS vulnerabilities before compilation
+        if (!_isSafeRegExp(pattern)) {
+          throw new Error(`[ShieldWall] Unsafe RegExp pattern in "${name}" string "${key}": pattern contains dangerous nested quantifiers that may cause ReDoS`);
+        }
+        
         def.compiled = def.type === 'regex'
           ? new RegExp(def.pattern, def.flags || '')
-          : new RegExp(def.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), def.nocase ? 'i' : '');
+          : new RegExp(pattern, def.nocase ? 'i' : '');
       } catch (e) { throw new Error(`[ShieldWall] Bad regex in "${name}" string "${key}": ${e.message}`); }
     }
     return rule;

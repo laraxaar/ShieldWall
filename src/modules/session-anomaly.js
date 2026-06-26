@@ -39,6 +39,23 @@ const CITY_COORDS = {
 const MOBILE_UA_PATTERN = /Android|iPhone|iPad|iPod|Mobile|Windows Phone/i;
 
 /**
+ * Generates a cryptographically secure session ID.
+ * FIX: BUG_21 — Session fixation via weak session ID. Uses crypto.randomBytes
+ * to generate unpredictable session identifiers preventing session hijacking.
+ * @param {string} ip - Client IP address.
+ * @param {string} userAgent - User-Agent string.
+ * @returns {string} Secure session ID.
+ */
+function _generateSecureSessionId(ip, userAgent) {
+  const crypto = require('crypto');
+  const timestamp = Date.now();
+  const random = crypto.randomBytes(16).toString('hex');
+  const input = `${ip}:${userAgent}:${timestamp}:${random}`;
+  
+  return crypto.createHash('sha256').update(input).digest('hex').substring(0, 32);
+}
+
+/**
  * Heuristically determines if the client is running on a mobile OS.
  * @param {string} userAgent - Raw HTTP User-Agent header.
  * @returns {boolean} True if matching a known mobile browser pattern.
@@ -215,9 +232,12 @@ function checkFingerprintChange(sessionId, fingerprint) {
  * @returns {Array} Risk match instances for engine evaluation.
  */
 const IP_SESSION_MAP = new Map();
+const MAX_IP_SESSIONS = 10000; // Global limit
+const IP_SESSION_TTL = 3600000; // 1 hour
 
 function check(decodedReq) {
-  const sessionId = decodedReq.sessionId || `${decodedReq.ip}:${decodedReq.userAgent}`;
+  // FIX: BUG_21 — Use cryptographically secure session ID generation
+  const sessionId = decodedReq.sessionId || _generateSecureSessionId(decodedReq.ip, decodedReq.userAgent);
   if (!sessionId) return [];
 
   const now = Date.now();
@@ -368,15 +388,43 @@ function check(decodedReq) {
 
 /**
  * Triggers LRU boundaries to prevent the Map() from consuming excessive OS RAM limits.
+ * FIX: BUG_15 — Added IP_SESSION_MAP cleanup to prevent memory leak during botnet attacks.
  */
 function _cleanup() {
   const cutoff = Date.now() - MAX_SESSION_AGE;
+  
+  // Clean SESSION_DATA
   for (const [key, value] of SESSION_DATA.entries()) {
     if (value.firstSeen < cutoff) {
       SESSION_DATA.delete(key);
       SESSION_GRAPHS.delete(key);
       RESOURCE_ACCESS.delete(key);
     }
+  }
+  
+  // Clean IP_SESSION_MAP with TTL and global size limit
+  const ipCutoff = Date.now() - IP_SESSION_TTL;
+  for (const [ip, sessions] of IP_SESSION_MAP.entries()) {
+    // Remove old sessions from the Set
+    for (const sessionId of sessions) {
+      const sessionData = SESSION_DATA.get(sessionId);
+      if (!sessionData || sessionData.firstSeen < ipCutoff) {
+        sessions.delete(sessionId);
+      }
+    }
+    
+    // Remove empty IP entries
+    if (sessions.size === 0) {
+      IP_SESSION_MAP.delete(ip);
+    }
+  }
+  
+  // Global size limit enforcement
+  if (IP_SESSION_MAP.size > MAX_IP_SESSIONS) {
+    const entries = Array.from(IP_SESSION_MAP.entries());
+    entries.slice(0, entries.length - MAX_IP_SESSIONS).forEach(([ip]) => {
+      IP_SESSION_MAP.delete(ip);
+    });
   }
 }
 
